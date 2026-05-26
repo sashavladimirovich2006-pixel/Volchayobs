@@ -93,6 +93,16 @@ qt_add_resources(volchay-obs "volchay_resources"
         resources/icons/log.svg
         resources/icons/eye.svg
         resources/icons/eye-off.svg
+        resources/icons/monitor.svg
+        resources/icons/window.svg
+        resources/icons/camera.svg
+        resources/icons/film.svg
+        resources/icons/image.svg
+        resources/icons/palette.svg
+        resources/icons/text.svg
+        resources/icons/grid.svg
+        resources/icons/globe.svg
+        resources/icons/speaker.svg
 )
 
 target_include_directories(volchay-obs PRIVATE src)

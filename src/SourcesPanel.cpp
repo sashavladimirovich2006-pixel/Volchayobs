@@ -3,6 +3,7 @@
 #include "SourceConfigDialog.h"
 
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QListWidget>
 #include <QMenu>
@@ -15,19 +16,22 @@ namespace lumen {
 
 namespace {
 
-QString glyphFor(SourceType t) {
+// Lucide-style SVG glyphs replace the legacy `[D]`/`[W]`/... text prefix.
+// One icon per SourceType; loaded from the Qt resource system so they
+// theme via the QSS `color`/stroke="currentColor" pipeline.
+QString iconPathFor(SourceType t) {
     switch (t) {
-        case SourceType::DisplayCapture:     return QStringLiteral("[D]");
-        case SourceType::WindowCapture:      return QStringLiteral("[W]");
-        case SourceType::VideoCaptureDevice: return QStringLiteral("[C]");
-        case SourceType::MediaFile:          return QStringLiteral("[M]");
-        case SourceType::Image:              return QStringLiteral("[I]");
-        case SourceType::ColorSource:        return QStringLiteral("[#]");
-        case SourceType::TextSource:         return QStringLiteral("[T]");
-        case SourceType::TestPattern:        return QStringLiteral("[P]");
-        case SourceType::BrowserSource:      return QStringLiteral("[B]");
-        case SourceType::Microphone:         return QStringLiteral("[m]");
-        case SourceType::DesktopAudio:       return QStringLiteral("[a]");
+        case SourceType::DisplayCapture:     return QStringLiteral(":/resources/icons/monitor.svg");
+        case SourceType::WindowCapture:      return QStringLiteral(":/resources/icons/window.svg");
+        case SourceType::VideoCaptureDevice: return QStringLiteral(":/resources/icons/camera.svg");
+        case SourceType::MediaFile:          return QStringLiteral(":/resources/icons/film.svg");
+        case SourceType::Image:              return QStringLiteral(":/resources/icons/image.svg");
+        case SourceType::ColorSource:        return QStringLiteral(":/resources/icons/palette.svg");
+        case SourceType::TextSource:         return QStringLiteral(":/resources/icons/text.svg");
+        case SourceType::TestPattern:        return QStringLiteral(":/resources/icons/grid.svg");
+        case SourceType::BrowserSource:      return QStringLiteral(":/resources/icons/globe.svg");
+        case SourceType::Microphone:         return QStringLiteral(":/resources/icons/mic.svg");
+        case SourceType::DesktopAudio:       return QStringLiteral(":/resources/icons/speaker.svg");
     }
     return QString();
 }
@@ -60,6 +64,7 @@ SourcesPanel::SourcesPanel(ThemeManager* theme, QWidget* parent)
     m_list->setSelectionMode(QAbstractItemView::SingleSelection);
     m_list->setAlternatingRowColors(true);
     m_list->setUniformItemSizes(true);
+    m_list->setIconSize(QSize(18, 18));
     connect(m_list, &QListWidget::itemChanged,
             this, &SourcesPanel::onItemEnableToggled);
     connect(m_list, &QListWidget::itemSelectionChanged,
@@ -106,7 +111,8 @@ int SourcesPanel::selectedIndex() const {
 
 QListWidgetItem* SourcesPanel::makeItem(const Source& s) const {
     auto* it = new QListWidgetItem;
-    it->setText(QString("%1  %2").arg(glyphFor(s.type), s.name));
+    it->setText(s.name);
+    it->setIcon(QIcon(iconPathFor(s.type)));
     it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
     it->setCheckState(s.enabled ? Qt::Checked : Qt::Unchecked);
     it->setToolTip(sourceTypeDisplayName(s.type));
@@ -138,9 +144,8 @@ void SourcesPanel::onAddRequested() {
         SourceType::Microphone, SourceType::DesktopAudio,
     };
     for (auto t : allTypes) {
-        const QString label = QString("%1  %2").arg(glyphFor(t),
-                                                    sourceTypeDisplayName(t));
-        QAction* a = menu.addAction(label);
+        QAction* a = menu.addAction(QIcon(iconPathFor(t)),
+                                    sourceTypeDisplayName(t));
         a->setData(int(t));
     }
     QAction* picked = menu.exec(m_addBtn->mapToGlobal(

@@ -189,6 +189,15 @@ resources/
 - Добавлены `mic.svg`, `desktop.svg`, `log.svg` в Lucide-стиле (stroke-based, `currentColor`).
 - Зарегистрированы в `qt_add_resources` в `CMakeLists.txt`.
 
+**2b. Тематические SVG-иконки для каждого SourceType (`monitor.svg`, `window.svg`, `camera.svg`, `film.svg`, `image.svg`, `palette.svg`, `text.svg`, `grid.svg`, `globe.svg`, `speaker.svg`).**
+
+- Контекст: список источников и меню `+ Add` показывали тип через текстовые скобки `[D] Display capture`, `[W] Window capture`, `[m] Microphone` и т. д. (Screenshot_3). Это выглядело как ASCII-плейсхолдер из 90-х.
+- Решение: 10 новых Lucide-style SVG-иконок (плюс существующая `mic.svg` для Microphone). Все stroke-based с `currentColor`, чтобы цвет наследовался от темы через QSS.
+- В `src/SourcesPanel.cpp`: функция `glyphFor()` (возвращала `[X]` строки) заменена на `iconPathFor()` (возвращает путь к Qt-ресурсу). В `makeItem()` теперь `it->setIcon(QIcon(iconPathFor(s.type)))` плюс чистый `s.name` в тексте — без префикса-скобок. В `onAddRequested()` пункты меню тоже получают иконку через `menu.addAction(QIcon(...), name)`.
+- `m_list->setIconSize(18, 18)` — иконка чуть меньше строки, не доминирует над текстом.
+- Файлы зарегистрированы в `CMakeLists.txt`.
+- Эффект: SourcesPanel и dropdown «+ Add» теперь выглядят как современное OBS-меню — у каждой строки тематический глиф (монитор, окно, камера, плёнка, картинка, палитра, T, сетка, глобус, микрофон, динамик), без устаревших текстовых маркеров.
+
 **2a. Eye-иконки видимости в списке источников (`resources/icons/eye.svg`, `eye-off.svg`).**
 
 - Контекст: в `SourcesPanel` чекбокс видимости в `QListWidget` рендерился как сплошной оранжевый квадрат (`QListWidget::indicator:checked { background: {{ACCENT}} }`) — это выглядело как недоделанный плейсхолдер.
