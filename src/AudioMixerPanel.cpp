@@ -156,28 +156,32 @@ void AudioMixerPanel::rebuild() {
         mute->setCursor(Qt::PointingHandCursor);
         mute->setMinimumWidth(74);
         // Pill-shaped button that lights up red when muted, mirroring
-        // OBS's audio rack. Hover state is a slightly stronger border.
+        // OBS's audio rack. Text color cascades from the active theme
+        // (QApplication stylesheet QToolButton color) so it's readable on
+        // both Blackout and Light. Border uses rgba so it's visible on
+        // any background. :checked turns the pill solid red regardless.
         mute->setStyleSheet(QStringLiteral(
             "QToolButton {"
-            "  background: transparent;"
-            "  border: 1px solid palette(mid);"
+            "  background: rgba(128, 128, 128, 25);"
+            "  border: 1px solid rgba(160, 160, 160, 120);"
             "  border-radius: 10px;"
-            "  padding: 4px 12px;"
-            "  color: palette(window-text);"
-            "  font-weight: 600;"
+            "  padding: 5px 14px;"
+            "  font-weight: 700;"
             "  letter-spacing: 0.5px;"
             "}"
             "QToolButton:hover {"
-            "  border-color: palette(highlight);"
+            "  background: rgba(160, 160, 160, 50);"
+            "  border-color: rgba(200, 200, 200, 180);"
             "}"
             "QToolButton:checked {"
             "  background: #c0392b;"
-            "  border-color: #c0392b;"
-            "  color: white;"
+            "  border: 1px solid #ff6b5e;"
+            "  color: #FFFFFF;"
             "}"
             "QToolButton:checked:hover {"
             "  background: #e74c3c;"
-            "  border-color: #e74c3c;"
+            "  border-color: #ff8a7c;"
+            "  color: #FFFFFF;"
             "}"
         ));
         const QString id = s.id;
