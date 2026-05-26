@@ -22,6 +22,9 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(ThemeManager* theme, QWidget* parent = nullptr);
 
+protected:
+    bool eventFilter(QObject* obj, QEvent* ev) override;
+
 private slots:
     void onGoLiveClicked();
     void onSettingsClicked();

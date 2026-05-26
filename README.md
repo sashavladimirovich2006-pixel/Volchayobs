@@ -165,6 +165,27 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Deselect handles при клике вне превью (Screenshot_11)
+
+Контекст: на Screenshot_11 видно, что 8 оранжевых «кубиков» масштабирования (resize-handles) активного источника продолжают висеть на превью, даже когда юзер уже работает с другой панелью (audio mixer, sources list, top-bar). PreviewWidget сам умеет гасить selection при клике на пустой холст внутри своих границ (`mousePressEvent` lines 807-817), но снаружи превью клики на него никак не действуют — handles остаются как «зависший» indicator, шум на сцене.
+
+Ожидание: клик в любую другую область программы → handles исчезают; клик обратно на источник в превью → handles появляются (это уже работало через `PreviewWidget::sourceSelected` сигнал, ничего трогать не надо).
+
+**Что сделано:**
+
+- `src/MainWindow.h`: добавлен override `bool eventFilter(QObject* obj, QEvent* ev)` в `protected:` секцию.
+- `src/MainWindow.cpp`:
+  - Подключены `<QApplication>` и `<QEvent>`.
+  - В конструкторе после `refreshStreamSummary()` добавлено `qApp->installEventFilter(this)` — глобальный watcher на все события приложения.
+  - Реализован `MainWindow::eventFilter`: на `MouseButtonPress` проверяется, что target widget принадлежит этому окну (`w->window() == this`, отсекает SettingsDialog и комбобокс-попапы), и что он НЕ является `m_preview` или его потомком (BrowserLayer для Browser-источников) И НЕ принадлежит `m_sourcesPanel`. Если оба условия true — гасим selection: `m_preview->setActiveSourceId("")` + `m_sourcesPanel->setSelectedSourceId("")` для синхронизации списка справа.
+  - Возвращаем `QMainWindow::eventFilter(obj, ev)` чтобы не глотать событие — клик нормально доходит до целевого виджета (mixer, log и т.д.).
+
+**Почему именно eventFilter, а не override `mousePressEvent` на MainWindow:** `QMainWindow::mousePressEvent` вызывается только когда клик пришёлся на пустое место самого `central widget`, не пробрасывая клики от дочерних виджетов. Чтобы поймать клик «куда угодно в окне», нужен либо `installEventFilter(qApp)`, либо subclass'инг каждого ребёнка — eventFilter короче и сосредоточен в одном месте.
+
+**Почему `m_sourcesPanel` исключён из триггера:** клик на строку источника в правой панели меняет активный источник через сигнал `selectionChanged`. Если бы eventFilter сначала чистил selection, а потом панель его восстанавливала — был бы лишний раунд событий и потенциальный flicker. Проще не трогать selection когда клик попал внутрь `SourcesPanel`.
+
+**Эффект:** теперь UX как в OBS Studio / Photoshop — handles живут только пока фокус на сцене. Юзер двигает фейдер микшера или скроллит лог — превью моментально успокаивается, не отвлекая визуальным шумом.
+
 ### 2026-05-27 — Sidebar nav: «парящий dynamic island» вместо edge-to-edge полоски
 
 Контекст: на Screenshot_10 активный пункт «Stream» был визуально привязан к самому краю сайдбара через `border-left: 4px solid ACCENT` + горизонтальный градиент — классический «active rail» из 2015-х. Хотелось перевести индикацию активной вкладки в современную dynamic-island эстетику: компактный закруглённый pill, отделённый от краёв воздухом, с акцентной обводкой по всему периметру вместо одной полоски слева.

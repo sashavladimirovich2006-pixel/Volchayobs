@@ -6,8 +6,10 @@
 #include "PreviewWidget.h"
 #include "SourcesPanel.h"
 
+#include <QApplication>
 #include <QColor>
 #include <QDesktopServices>
+#include <QEvent>
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -159,6 +161,29 @@ MainWindow::MainWindow(ThemeManager* theme, QWidget* parent)
     connect(m_engine, &StreamEngine::statsUpdated, this, &MainWindow::onStreamStats);
 
     refreshStreamSummary();
+
+    // App-wide click watcher: any LMB press outside the preview and the
+    // sources panel drops the active selection so the dashed frame +
+    // 8 resize handles disappear. Clicking back on a source body
+    // inside the preview re-selects it via PreviewWidget's own
+    // mousePressEvent — no extra wiring needed.
+    qApp->installEventFilter(this);
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* ev) {
+    if (ev->type() == QEvent::MouseButtonPress && m_preview) {
+        auto* w = qobject_cast<QWidget*>(obj);
+        if (w && w->window() == this) {
+            const bool inPreview = (w == m_preview) || m_preview->isAncestorOf(w);
+            const bool inSources = m_sourcesPanel &&
+                (w == m_sourcesPanel || m_sourcesPanel->isAncestorOf(w));
+            if (!inPreview && !inSources) {
+                m_preview->setActiveSourceId(QString());
+                if (m_sourcesPanel) m_sourcesPanel->setSelectedSourceId(QString());
+            }
+        }
+    }
+    return QMainWindow::eventFilter(obj, ev);
 }
 
 void MainWindow::buildStreamPage() {
