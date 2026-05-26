@@ -189,6 +189,12 @@ resources/
 - Добавлены `mic.svg`, `desktop.svg`, `log.svg` в Lucide-стиле (stroke-based, `currentColor`).
 - Зарегистрированы в `qt_add_resources` в `CMakeLists.txt`.
 
+**2d. Sidebar nav-иконки `stream/settings/info/log.svg` — амбер вместо `currentColor`.**
+
+- Контекст: на Blackout пункты Settings и About показывали почти невидимые иконки (Screenshot_8). Та же причина что у source-иконок в 2b → `QIcon` при рендере SVG в `QPushButton[role="nav"]` не наследует `currentColor` через QSS. Активный пункт (Stream) случайно отрендерился оранжевым только потому, что Qt пересчитал иконку после смены checked-state и подхватил `color: {{ACCENT}}` из активного селектора.
+- Решение: захардкодить `stroke="#FF9900"` во всех четырёх sidebar/log иконках для гарантированной видимости. У nav-кнопок активность всё равно отчётливо показывается через `border-left: 4px solid ACCENT` и оранжевый текст — единого амбера у иконки достаточно.
+- `play.svg`/`stop.svg` намеренно оставил с `currentColor`: они на primary-кнопке `Go live`/`Stop` с ярким оранжевым фоном, где `currentColor` фолбэкается в `#0A0A0A` (color из QSS для primary), что даёт читаемый тёмный треугольник на оранжевом — никакого фикса не требует.
+
 **2c. Фикс «белых полосок» в audio mixer (`AudioMixerPanel.cpp`, `AudioLevelMeter.cpp`).**
 
 - Контекст: на Blackout и RGB темах слайдер громкости показывал синюю заливку (Windows-системный `palette(highlight)`) + светло-серую остальную часть трэка (`palette(mid)`), которая выглядела как яркая «белая полоска». Параллельно у VU-метра рейл рендерился через `palette(WindowText)` с alpha 70 — на тёмной теме это даёт почти-белый цвет (Screenshot_7).
