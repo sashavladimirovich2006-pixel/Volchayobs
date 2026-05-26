@@ -203,35 +203,36 @@ void AudioMixerPanel::rebuild() {
         slider->setMinimumWidth(180);
         slider->setCursor(Qt::PointingHandCursor);
         // OBS-style fader: thin groove with the live volume drawn in
-        // the accent colour, a round handle that sits above the
-        // groove. palette(highlight) gives us the active accent on
-        // every theme (Light / Blackout / RGB) without us hard-coding
-        // a hex value here.
+        // the amber brand accent, a round handle that sits above the
+        // groove. Hardcoded colors (not palette(...)) because Qt's
+        // platform palette gives a Windows-system blue for `highlight`
+        // and a near-white grey for `mid` — both wrong on Blackout/RGB.
+        // rgba grey reads as a faint rail on every theme.
         slider->setStyleSheet(QStringLiteral(
             "QSlider::groove:horizontal {"
             "  height: 4px;"
-            "  background: palette(mid);"
+            "  background: rgba(128, 128, 128, 60);"
             "  border-radius: 2px;"
             "}"
             "QSlider::sub-page:horizontal {"
-            "  background: palette(highlight);"
+            "  background: #FF9900;"
             "  border-radius: 2px;"
             "}"
             "QSlider::add-page:horizontal {"
-            "  background: palette(mid);"
+            "  background: rgba(128, 128, 128, 60);"
             "  border-radius: 2px;"
             "}"
             "QSlider::handle:horizontal {"
-            "  background: palette(highlight);"
-            "  border: 2px solid palette(base);"
+            "  background: #FF9900;"
+            "  border: 2px solid rgba(0, 0, 0, 140);"
             "  width: 14px;"
             "  height: 14px;"
             "  margin: -7px 0;"
             "  border-radius: 9px;"
             "}"
             "QSlider::handle:horizontal:hover {"
-            "  background: palette(highlight);"
-            "  border: 2px solid palette(window-text);"
+            "  background: #FFB347;"
+            "  border: 2px solid rgba(255, 255, 255, 180);"
             "}"
         ));
 

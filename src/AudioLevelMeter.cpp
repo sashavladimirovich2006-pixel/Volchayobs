@@ -98,14 +98,12 @@ void AudioLevelMeter::paintEvent(QPaintEvent*) {
     const QRect r = rect();
     if (r.width() <= 0 || r.height() <= 0) return;
 
-    // Track (background). Derive a contrasting colour from the
-    // palette so the rail is always visible on both light and dark
-    // themes — users have asked to "see the bar" before any audio is
-    // flowing.
-    const QColor base = palette().color(QPalette::Active, QPalette::WindowText);
-    QColor track = base;
-    track.setAlpha(base.lightnessF() > 0.5 ? 90 : 70);
-    p.fillRect(r, track);
+    // Track (background). Faint neutral grey via rgba so it reads as
+    // a subtle rail on every theme — previously we pulled from
+    // palette(WindowText), which on Blackout/RGB is near-white and
+    // produced an obvious "white stripe" that competed with the live
+    // gradient fill (Screenshot_7).
+    p.fillRect(r, QColor(128, 128, 128, 60));
 
     // Filled portion — green/yellow/red gradient matching OBS.
     const double live = dbToFraction(m_db);
@@ -120,12 +118,14 @@ void AudioLevelMeter::paintEvent(QPaintEvent*) {
         p.fillRect(fillRect, QBrush(g));
     }
 
-    // Sliding peak indicator — thin 2 px vertical bar, palette-aware.
+    // Sliding peak indicator — thin 2 px vertical bar in the brand
+    // amber so it stays visible on top of both the grey rail and the
+    // green/yellow/red fill gradient.
     const double peak = dbToFraction(m_peakDb);
     if (peak > 0.0) {
         const int px = int(r.x() + r.width() * peak - 1.0);
         QRect peakRect(px, r.y(), 2, r.height());
-        p.fillRect(peakRect, base);
+        p.fillRect(peakRect, QColor(0xFF, 0x99, 0x00));
     }
 }
 

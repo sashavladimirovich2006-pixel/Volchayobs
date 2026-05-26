@@ -189,6 +189,14 @@ resources/
 - Добавлены `mic.svg`, `desktop.svg`, `log.svg` в Lucide-стиле (stroke-based, `currentColor`).
 - Зарегистрированы в `qt_add_resources` в `CMakeLists.txt`.
 
+**2c. Фикс «белых полосок» в audio mixer (`AudioMixerPanel.cpp`, `AudioLevelMeter.cpp`).**
+
+- Контекст: на Blackout и RGB темах слайдер громкости показывал синюю заливку (Windows-системный `palette(highlight)`) + светло-серую остальную часть трэка (`palette(mid)`), которая выглядела как яркая «белая полоска». Параллельно у VU-метра рейл рендерился через `palette(WindowText)` с alpha 70 — на тёмной теме это даёт почти-белый цвет (Screenshot_7).
+- Решение: вместо платформенной палитры — фиксированные значения, согласованные с бренд-стилем:
+  - QSlider: `sub-page` и `handle` → `#FF9900` (амбер), `groove`/`add-page` → `rgba(128,128,128,60)` — нейтральный приглушённый серый, читается на любой теме.
+  - AudioLevelMeter: track-цвет → `rgba(128,128,128,60)` (тот же серый, единый язык с слайдером). Peak-маркер → `#FF9900` (был белый из palette, теперь акцент — видно на любой части gradient'а).
+- Эффект: на Blackout слайдер и метр выглядят как тонкие приглушённые серые рейлы с яркой амбер-заливкой — никаких больше «белых полосок». На Light тёмно-серый rgba даёт спокойный нейтральный фон.
+
 **2b. Тематические SVG-иконки для каждого SourceType (`monitor.svg`, `window.svg`, `camera.svg`, `film.svg`, `image.svg`, `palette.svg`, `text.svg`, `grid.svg`, `globe.svg`, `speaker.svg`).**
 
 - Контекст: список источников и меню `+ Add` показывали тип через текстовые скобки `[D] Display capture`, `[W] Window capture`, `[m] Microphone` и т. д. (Screenshot_3). Это выглядело как ASCII-плейсхолдер из 90-х.
