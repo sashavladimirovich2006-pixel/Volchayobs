@@ -73,7 +73,7 @@ QPushButton[role="nav"]:focus {
 QFrame[role="card"] {
     background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 #141414, stop:1 #0E0E0E);
-    border: 1px solid {{ACCENT}};
+    border: 1px solid #222222;
     border-radius: 16px;
 }
 

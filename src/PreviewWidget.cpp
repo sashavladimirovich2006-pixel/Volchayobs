@@ -610,16 +610,16 @@ void PreviewWidget::paintEvent(QPaintEvent*) {
         } else {
             caption = tr("Selected: %1  ·  drag corners to resize, body to move").arg(as.name);
         }
-    } else if (anyEnabledVideo()) {
-        caption = tr("Click a source on the canvas or in the sources list to edit");
-    } else {
+    } else if (!anyEnabledVideo()) {
         caption = tr("Add a source from the «Sources» panel");
     }
-    QRect captionRect(r.left() + 12, r.bottom() - 44, r.width() - 24, 18);
-    p.setPen(QColor(0, 0, 0, 160));
-    p.drawText(captionRect.translated(1, 1), Qt::AlignLeft | Qt::AlignVCenter, caption);
-    p.setPen(QColor(220, 220, 220));
-    p.drawText(captionRect, Qt::AlignLeft | Qt::AlignVCenter, caption);
+    const QRect captionRect(r.left() + 12, r.bottom() - 44, r.width() - 24, 18);
+    if (!caption.isEmpty()) {
+        p.setPen(QColor(0, 0, 0, 160));
+        p.drawText(captionRect.translated(1, 1), Qt::AlignLeft | Qt::AlignVCenter, caption);
+        p.setPen(QColor(220, 220, 220));
+        p.drawText(captionRect, Qt::AlignLeft | Qt::AlignVCenter, caption);
+    }
 
     if (!m_summary.isEmpty()) {
         p.setPen(QColor(160, 160, 160));
