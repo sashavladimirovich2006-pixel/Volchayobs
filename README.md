@@ -189,6 +189,14 @@ resources/
 - Добавлены `mic.svg`, `desktop.svg`, `log.svg` в Lucide-стиле (stroke-based, `currentColor`).
 - Зарегистрированы в `qt_add_resources` в `CMakeLists.txt`.
 
+**2a. Eye-иконки видимости в списке источников (`resources/icons/eye.svg`, `eye-off.svg`).**
+
+- Контекст: в `SourcesPanel` чекбокс видимости в `QListWidget` рендерился как сплошной оранжевый квадрат (`QListWidget::indicator:checked { background: {{ACCENT}} }`) — это выглядело как недоделанный плейсхолдер.
+- Решение: два Lucide-style SVG — открытый глаз `eye.svg` (`#FF9900`, состояние «видим») и перечёркнутый `eye-off.svg` (`#7A7A7A`, состояние «скрыт»). Никаких внешних библиотек, всё inline-stroke.
+- Изменены три темы (`blackout.qss`, `light.qss`, `rgb.qss`): селекторы `QListWidget::indicator:checked/unchecked` теперь используют `image: url(:/resources/icons/eye.svg)` вместо заливки фона. Hover подсвечивает чекбокс полупрозрачным акцентом (`ACCENT_GHOST` в RGB, `rgba(255,153,0,0.10/0.12)` на остальных). Размер чекбокса 20×20 (было 18×18) — глаз читается лучше.
+- Файлы зарегистрированы в `CMakeLists.txt` рядом с остальными иконками.
+- Эффект: в `SourcesPanel` каждая строка теперь имеет глаз слева — наглядный визуальный «toggle visibility» в духе OBS, без объяснений понятный любому пользователю.
+
 **3. Логгер (`src/Logger.h`, `src/Logger.cpp`) — новый модуль.**
 
 - Singleton с потокобезопасной записью через `QMutexLocker`.

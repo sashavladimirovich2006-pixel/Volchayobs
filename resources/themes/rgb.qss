@@ -325,21 +325,20 @@ QListWidget::item:selected {
 }
 
 QListWidget::indicator {
-    width: 18px; height: 18px;
-    margin-right: 6px;
-    border-radius: 5px;
-    border: 1px solid {{ACCENT_DIM}};
-    background: #0A0A0A;
-}
-QListWidget::indicator:hover {
-    border-color: {{ACCENT}};
+    width: 20px; height: 20px;
+    margin-right: 8px;
+    border: 0;
+    background: transparent;
 }
 QListWidget::indicator:checked {
-    background: {{ACCENT}};
-    border-color: {{ACCENT}};
+    image: url(:/resources/icons/eye.svg);
 }
 QListWidget::indicator:unchecked {
-    background: #0A0A0A;
+    image: url(:/resources/icons/eye-off.svg);
+}
+QListWidget::indicator:hover {
+    background: {{ACCENT_GHOST}};
+    border-radius: 6px;
 }
 
 QToolButton {
