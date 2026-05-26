@@ -38,35 +38,36 @@ QLabel#brandSub {
     font-weight: 600;
 }
 
+/* Sidebar nav buttons — "dynamic island" floating pills */
 QPushButton[role="nav"] {
     background-color: transparent;
-    border: none;
+    border: 1.5px solid transparent;
+    border-radius: 14px;
     color: #555555;
     text-align: left;
-    padding: 13px 18px;
+    padding: 10px 16px;
+    margin: 3px 10px;
     font-size: 13px;
     font-weight: 500;
-    border-left: 4px solid transparent;
     outline: 0;
 }
 
 QPushButton[role="nav"]:hover {
     color: #1A1A1A;
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {{ACCENT_GHOST}}, stop:1 transparent);
+    background-color: {{ACCENT_GHOST}};
 }
 
 QPushButton[role="nav"][selected="true"] {
     color: {{ACCENT_DIM}};
-    border-left: 4px solid {{ACCENT}};
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {{ACCENT_GHOST}}, stop:0.7 transparent);
-    font-weight: 600;
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 {{ACCENT_GHOST}}, stop:1 transparent);
+    border: 1.5px solid {{ACCENT}};
+    font-weight: 700;
 }
 
 QPushButton[role="nav"]:focus {
     outline: 0;
-    border-left: 4px solid {{ACCENT_SOFT}};
+    border: 1.5px solid {{ACCENT_SOFT}};
 }
 
 QFrame[role="card"] {
