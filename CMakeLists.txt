@@ -45,8 +45,6 @@ set(VOLCHAY_SOURCES
     src/ThemeManager.h
     src/PreviewWidget.cpp
     src/PreviewWidget.h
-    src/AccentBadge.cpp
-    src/AccentBadge.h
     src/Devices.cpp
     src/Devices.h
     src/Source.cpp

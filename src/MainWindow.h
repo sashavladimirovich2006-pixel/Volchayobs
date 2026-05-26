@@ -14,7 +14,6 @@ class QLabel;
 namespace lumen {
 
 class PreviewWidget;
-class AccentBadge;
 class SourcesPanel;
 class AudioMixerPanel;
 
@@ -57,7 +56,6 @@ private:
     QPushButton*    m_navAbout   = nullptr;
 
     PreviewWidget*  m_preview = nullptr;
-    AccentBadge*    m_badge = nullptr;
     QLabel*         m_statusPill = nullptr;
     QLabel*         m_presetLabel = nullptr;
     QLabel*         m_bitrateLabel = nullptr;

@@ -60,7 +60,7 @@ void ThemeManager::onRgbTick() {
     m_accent = QColor::fromHsvF(m_rgbHue / 360.0, 0.85, 1.0);
     // Repainting QSS-styled widgets requires a full setStyleSheet, which
     // is expensive. Throttle the QSS rebuild to ~30 Hz; native-painted
-    // widgets (PreviewWidget, AccentBadge) just listen to accentChanged
+    // widgets (PreviewWidget) just listen to accentChanged
     // and call update(), so they keep getting the new colour every tick.
     ++m_rgbStyleSkip;
     if (m_rgbStyleSkip >= 2) {

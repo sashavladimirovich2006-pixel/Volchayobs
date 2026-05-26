@@ -1,6 +1,5 @@
 #include "MainWindow.h"
 
-#include "AccentBadge.h"
 #include "AudioMixerPanel.h"
 #include "Logger.h"
 #include "PresetManager.h"
@@ -94,7 +93,12 @@ MainWindow::MainWindow(ThemeManager* theme, QWidget* parent)
     auto* brandLayout = new QHBoxLayout(brand);
     brandLayout->setContentsMargins(20, 0, 20, 24);
     brandLayout->setSpacing(10);
-    m_badge = new AccentBadge(m_theme);
+    auto* brandIcon = new QLabel;
+    brandIcon->setFixedSize(36, 36);
+    brandIcon->setPixmap(
+        QIcon(QStringLiteral(":/resources/icons/logo.svg"))
+            .pixmap(36, 36));
+    brandIcon->setScaledContents(true);
     auto* brandTextWrap = new QWidget;
     auto* brandText = new QVBoxLayout(brandTextWrap);
     brandText->setContentsMargins(0, 0, 0, 0);
@@ -105,7 +109,7 @@ MainWindow::MainWindow(ThemeManager* theme, QWidget* parent)
     brandSub->setObjectName(QStringLiteral("brandSub"));
     brandText->addWidget(brandTitle);
     brandText->addWidget(brandSub);
-    brandLayout->addWidget(m_badge);
+    brandLayout->addWidget(brandIcon);
     brandLayout->addWidget(brandTextWrap, 1);
 
     m_navStream = makeNavButton(tr("Stream"), QStringLiteral(":/resources/icons/stream.svg"));

@@ -141,7 +141,6 @@ src/
 ├── StreamEngine.{h,cpp}  — обёртка над QProcess для ffmpeg
 ├── ThemeManager.{h,cpp}  — подмена placeholder'ов в QSS, RGB-таймер
 ├── PreviewWidget.{h,cpp} — отрисовка сцены, drag/resize источников
-├── AccentBadge.{h,cpp}   — кружок-индикатор акцента в сайдбаре
 ├── Source*.{h,cpp}       — модели источников (Display/Window/Image/Browser)
 ├── AudioMixerPanel.*     — strip'ы микрофона и desktop-аудио
 ├── AudioLevelMeter.*     — VU-метры
@@ -165,6 +164,21 @@ resources/
 ## Журнал разработки
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
+
+### 2026-05-27 — Замена кружка-индикатора на логотип в сайдбаре
+
+Контекст: на Screenshot_9 видно, что слева от шапки «VOLCHAY / OBS» висел маленький оранжевый кружок (`AccentBadge`, 16×16) — он не нёс смысла, дублировал акцент темы и выглядел как случайное пятно. Логичнее ставить туда фактическую иконку приложения (`resources/icons/logo.svg`), та же, что используется в `setWindowIcon()`.
+
+**Что сделано:**
+
+- `src/MainWindow.cpp`: убран `m_badge = new AccentBadge(m_theme)`. Вместо него — локальный `QLabel brandIcon` 36×36 с `setPixmap(QIcon(":/resources/icons/logo.svg").pixmap(36, 36))`. Размер подобран так, чтобы лого занимал высоту обоих строк «VOLCHAY/OBS» и читался как полноценный знак, а не как точка-индикатор.
+- `src/MainWindow.h`: удалены forward-declaration `class AccentBadge;` и поле `AccentBadge* m_badge` — теперь это локальная переменная, член класса не нужен (нигде больше не используется).
+- `src/AccentBadge.{h,cpp}` — удалены, класс полностью неиспользуемый.
+- `CMakeLists.txt`: убраны `src/AccentBadge.cpp/.h` из `VOLCHAY_SOURCES`.
+- `src/ThemeManager.cpp`: подправлен комментарий — убрана ссылка на удалённый AccentBadge.
+- `README.md`: в архитектурной схеме удалена строка про `AccentBadge.{h,cpp}`.
+
+**Эффект:** в шапке сайдбара теперь видно нормальный broadcast-логотип (тёмный квадрат с радио-волнами и красной LIVE-точкой) — тот же знак, что в иконке окна и `logo.ico`. Идентичность брэнда стала консистентной по всему приложению.
 
 ### 2026-05-26 — Модернизация UI и инфраструктуры
 
