@@ -192,7 +192,8 @@ resources/
 **2b. Тематические SVG-иконки для каждого SourceType (`monitor.svg`, `window.svg`, `camera.svg`, `film.svg`, `image.svg`, `palette.svg`, `text.svg`, `grid.svg`, `globe.svg`, `speaker.svg`).**
 
 - Контекст: список источников и меню `+ Add` показывали тип через текстовые скобки `[D] Display capture`, `[W] Window capture`, `[m] Microphone` и т. д. (Screenshot_3). Это выглядело как ASCII-плейсхолдер из 90-х.
-- Решение: 10 новых Lucide-style SVG-иконок (плюс существующая `mic.svg` для Microphone). Все stroke-based с `currentColor`, чтобы цвет наследовался от темы через QSS.
+- Решение: 10 новых Lucide-style SVG-иконок (плюс существующая `mic.svg` для Microphone). Все stroke-based.
+- Цвет stroke захардкожен в `#FF9900` (бренд-акцент). Причина: `QIcon` при рендере SVG в `QListWidget`/`QMenu` НЕ резолвит `currentColor` через QSS — иконка получает чёрную обводку и сливается с тёмным фоном (см. Screenshot_6). Фиксированный амбер виден на всех трёх темах и согласуется с `eye.svg`. Это сознательный выбор однотонной бренд-палитры вместо theme-aware иконок (для последнего пришлось бы рендерить через `QSvgRenderer` + `QPainter::CompositionMode_SourceIn`).
 - В `src/SourcesPanel.cpp`: функция `glyphFor()` (возвращала `[X]` строки) заменена на `iconPathFor()` (возвращает путь к Qt-ресурсу). В `makeItem()` теперь `it->setIcon(QIcon(iconPathFor(s.type)))` плюс чистый `s.name` в тексте — без префикса-скобок. В `onAddRequested()` пункты меню тоже получают иконку через `menu.addAction(QIcon(...), name)`.
 - `m_list->setIconSize(18, 18)` — иконка чуть меньше строки, не доминирует над текстом.
 - Файлы зарегистрированы в `CMakeLists.txt`.
