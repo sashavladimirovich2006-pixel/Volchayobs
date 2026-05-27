@@ -99,7 +99,7 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             // ddagrab uses DXGI Desktop Duplication — much lower CPU/latency than gdigrab.
             // Falls back to gdigrab if ddagrab is unavailable (older Windows/drivers).
             const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
-            args << "-thread_queue_size" << "512"
+            args << "-thread_queue_size" << "1024"
                  << "-f" << "lavfi"
                  << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
                               .arg(screenIdx).arg(fps);
@@ -259,8 +259,16 @@ QStringList audioInputArgsFor(const Source& s) {
     if (id.isEmpty()) return args;
 
 #if defined(Q_OS_WIN)
-    args << "-thread_queue_size" << "512"
-         << "-f" << "dshow" << "-i" << QString("audio=%1").arg(id);
+    // -use_wallclock_as_timestamps overrides dshow's PTS (which on Windows
+    // is system-uptime in seconds — e.g. 8163.5s on a machine that's been
+    // up 2 hours). Without this, ffmpeg tries to align video (starting at
+    // PTS=0) against audio (starting at PTS=N-thousand-seconds), which
+    // chokes the video pull-thread and ddagrab drops to ~7 unique fps
+    // (everything else gets duplicated up to the requested 60).
+    args << "-thread_queue_size" << "1024"
+         << "-f" << "dshow"
+         << "-use_wallclock_as_timestamps" << "1"
+         << "-i" << QString("audio=%1").arg(id);
 #elif defined(Q_OS_MACOS)
     args << "-f" << "avfoundation" << "-i" << QString(":%1").arg(id);
 #else
