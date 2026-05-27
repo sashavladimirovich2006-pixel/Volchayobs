@@ -165,6 +165,50 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Тринадцатая итерация: пакет анти-stall флагов на capture и mux
+
+**Контекст и наблюдение.** Двенадцатая итерация дополнила two-process путь правильным `asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=...` для каждого dshow-аудио и подняла `-thread_queue_size 4096` на pipe input mux'а. Юзер протестировал — **паттерн stall'ов не изменился**:
+
+- frame=442 застряло на 8 секунд (10:29 → 11:33).
+- frame=563 застряло на 8 секунд (12:36 → 13:39).
+- frame=678 застряло на 7 секунд (20:09 → 22:67).
+- frame=809 застряло на 7 секунд (27:31 → 29:89).
+
+`asetpts` точно применяется (виден в `Stream mapping: Stream #1:0 (pcm_s16le) -> asetpts:default`), команда mux построена правильно. **И всё равно те же 8-секундные паузы по тому же расписанию.**
+
+Это значит timestamps — не единственная и, возможно, не главная причина. Прочие подозреваемые:
+
+1. **mpegts muxer на capture-стороне** имеет дефолтный `-muxdelay 0.7s` + `-muxpreload 0.5s` (унаследовано от broadcast use-cases). Это значит mpegts накапливает ~1.2 секунды видео внутри muxer'а перед flush'ем, и потом разом сваливает в pipe. На 60fps это пачка ~72 пакетов. Capture пишет в pipe → pipe заполняется → write() блокируется → ddagrab pull stalls.
+2. **`-fflags +genpts+igndts`** не отключает inter-stream **demuxer-level** буферизацию. ffmpeg продолжает буферизовать audio пакеты с PTS=15730s ожидая «догоняющего» видео, ДО того как audio попадёт в filter_complex и asetpts его перепишет.
+3. **`-vsync` default («cfr»)** заставляет mux пересчитывать видео-фреймы под constant frame rate. Для `-c:v copy` это бесполезно но всё равно может вносить delay.
+4. **stderr capture буферизуется в pipe** → мы не видим capture progress-строк → не знаем кто реально stallит (capture сам или mux back-pressure'ит pipe → capture stalls).
+
+**Применённые изменения (пакет, чтобы отбить сразу несколько гипотез):**
+
+*На capture (`buildFfmpegPlan` → `plan.captureArgs`):*
+
+- `-stats` — форсирует ffmpeg писать progress-строки в stderr даже когда stderr подключён к pipe. Теперь в логе увидим `[capture] frame=N fps=M speed=Sx` в реальном времени → диагностика «кто stallит» станет тривиальной.
+- `-muxdelay 0 -muxpreload 0` — обнуляет mpegts muxer buffering. Каждый GOP уходит в pipe сразу после кодирования.
+- `-mpegts_flags +nobuffer` — внутренний флаг mpegts muxer'а, отключает буферизацию пакетов до DTS.
+- `-flush_packets 1` — заставляет ffmpeg flush'ить stdio после каждого AVPacket вместо libc-default.
+
+*На mux (`plan.muxArgs`):*
+
+- `-stats` — то же что у capture, для симметрии диагностики.
+- `-fflags +genpts+igndts+nobuffer+discardcorrupt` — расширил предыдущие два флага. `+nobuffer` пропускает demuxer-level inter-stream sync. `+discardcorrupt` дропает пакеты которые не могут быть aligned, вместо stall.
+- `-vsync passthrough` — копирует видео-фреймы как есть, не пересчитывая под CFR. Capture уже шлёт стабильный 60fps, mux'у не надо думать о timing.
+- `-thread_queue_size 16384` — поднял с 4096 до 16384 (≈4 секунды видео-буфера). Это overkill для гипотезы «4 кадров не хватало», но если он сработает — значит проблема реально была в OS-pipe backpressure.
+
+**Тронутые файлы:** `src/StreamEngine.cpp`.
+
+**Это эксперимент.** Я перебрал гипотезы и применил их пакетом, чтобы юзер не делал по 6 тестов подряд. Если поможет — следующая итерация будет бисектить какой именно флаг был ключевым, чтобы выкинуть лишние. Если не поможет — будут стоить капчер audio через `WasapiLoopback.cpp` напрямую, минуя ffmpeg-dshow (нативный WASAPI loopback выдаёт samples с wallclock-correct timestamps без 15700s offset, и его буферизация контролируется нашим Qt-кодом).
+
+**Что искать в новом логе:**
+
+- `[capture] frame=N fps=M` строки в реальном времени. Если capture-fps стабильный 60 — проблема осталась в mux. Если capture-fps тоже падает — проблема в capture (NVENC, ddagrab) и pipe back-pressure ни при чём.
+- В команде mux должно быть `-fflags +genpts+igndts+nobuffer+discardcorrupt -vsync passthrough -thread_queue_size 16384`.
+- В команде capture должно быть `-stats -muxdelay 0 -muxpreload 0 -mpegts_flags +nobuffer -flush_packets 1`.
+
 ### 2026-05-28 — Двенадцатая итерация: asetpts всё-таки попал в two-process путь + увеличен thread_queue_size на pipe
 
 **Контекст.** Одиннадцатая итерация декларировала «`asetpts=N/SR/TB` добавлен в filter_complex для всех dshow-входов». На деле это было правдой только для **single-process** ветки. Two-process ветка собирала `filter_complex` отдельным кодом (две почти идентичные `filter += QString("[%1:a]aresample=...")` строки в `buildFfmpegPlan`), и Edit с `replace_all` пропустил one из вхождений — заменилась только строка single-process пути (строка ~624), а строка two-process пути (~536) осталась со старым `aresample=async=1,volume=...` без asetpts.

@@ -483,17 +483,27 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // is never starved.
         QStringList& cap = plan.captureArgs;
         cap << "-hide_banner" << "-loglevel" << "info";
+        // `-stats` forces progress lines (`frame= fps= ...`) on stderr
+        // even when stderr is a pipe — without it ffmpeg suppresses them
+        // and we can't tell whether capture or mux is the one stalling.
+        cap << "-stats";
         cap << videoArgs;
         cap << "-map" << "0:v";
         if (!videoFilter.isEmpty()) cap << "-vf" << videoFilter;
         appendVideoEncoder(cap);
-        // MPEG-TS is the standard ffmpeg-to-ffmpeg streaming container —
-        // it has self-describing timestamps and survives mid-stream
-        // resync, unlike raw H.264 or FLV. `-avoid_negative_ts make_zero`
-        // anchors the first packet at PTS 0 so the mux side doesn't see
-        // a video stream starting at e.g. 1.4s while dshow audio starts
-        // at 13917s — that mismatch made mux buffer audio and back-pressure
-        // the pipe, throttling capture down from 60 → 27 fps.
+        // Real-time MPEG-TS over a pipe needs muxer tuning. Default
+        // -muxdelay (0.7s) and -muxpreload (0.5s) buffer ~1.2s of video
+        // at the mpegts muxer before it'll flush, which on a 60fps stream
+        // means bursts of ~70 frames suddenly hit the pipe at once. -mpegts_flags
+        // +nobuffer + -flush_packets 1 force every packet straight out.
+        cap << "-muxdelay" << "0"
+            << "-muxpreload" << "0"
+            << "-mpegts_flags" << "+nobuffer"
+            << "-flush_packets" << "1";
+        // `-avoid_negative_ts make_zero` anchors the first packet at PTS 0
+        // so the mux side doesn't see a video stream starting at 1.4s
+        // while dshow audio starts at 15730s — that mismatch made mux
+        // buffer audio and back-pressure the pipe.
         cap << "-avoid_negative_ts" << "make_zero";
         cap << "-f" << "mpegts" << "pipe:1";
 
@@ -502,19 +512,22 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // (inputs 1, 2, ...), mixes audio with the same filter graph
         // we used in the single-process path, and writes to RTMP.
         QStringList& mux = plan.muxArgs;
-        mux << "-hide_banner" << "-loglevel" << "info";
+        mux << "-hide_banner" << "-loglevel" << "info" << "-stats";
         // `+genpts` regenerates PTS if any packet comes through without
-        // one (paranoia for pipe restarts). `+igndts` keeps mux from
-        // stalling on dts jitter at startup before dshow has begun
-        // producing audio.
-        mux << "-fflags" << "+genpts+igndts";
-        // 4096 packets ≈ 0.7s of video at 60fps — plenty of headroom so
-        // that even if mux briefly back-pressures on aresample buffer
-        // build-up, the OS pipe never fills and capture-side write()
-        // doesn't block (the failure mode in iter 10-11 logs: frame=413
-        // sticking for 8 seconds while mux churned through accumulated
-        // audio).
-        mux << "-thread_queue_size" << "4096";
+        // one. `+igndts` keeps mux from stalling on dts jitter at startup.
+        // `+nobuffer` skips demuxer-level buffering (it was buffering audio
+        // until video caught up, which never happened because of the
+        // 15700s start delta). `+discardcorrupt` drops any packet that
+        // can't be aligned instead of stalling on it.
+        mux << "-fflags" << "+genpts+igndts+nobuffer+discardcorrupt";
+        // `-vsync passthrough` tells mux not to rewrite or sync video PTS;
+        // since capture already encoded with stable 60fps, we don't want
+        // mux to think about video timing at all — just copy bytes.
+        mux << "-vsync" << "passthrough";
+        // 16384 packets ≈ 4s of video burst headroom. Iter 12 used 4096
+        // (~1s) and the stalls persisted, so we're overshooting hard to
+        // rule out OS-pipe backpressure entirely.
+        mux << "-thread_queue_size" << "16384";
         mux << "-f" << "mpegts" << "-i" << "pipe:0";
 
         int audioInputCount = 0;
