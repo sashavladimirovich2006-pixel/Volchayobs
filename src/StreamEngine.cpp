@@ -96,19 +96,13 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             const auto screens = enumerateScreens();
 #if defined(Q_OS_WIN)
             QStringList args;
-            // -draw_mouse 1 keeps the system cursor in the gdigrab feed
-            // so viewers see what the streamer is pointing at.
-            args << "-f" << "gdigrab" << "-draw_mouse" << "1"
-                 << "-framerate" << fps;
-            if (idx >= 0 && idx < screens.size()) {
-                const auto& sc = screens[idx];
-                args << "-offset_x" << QString::number(sc.x)
-                     << "-offset_y" << QString::number(sc.y)
-                     << "-video_size" << QString("%1x%2").arg(sc.w).arg(sc.h);
-            } else {
-                args << "-video_size" << sz;
-            }
-            args << "-i" << "desktop";
+            // ddagrab uses DXGI Desktop Duplication — much lower CPU/latency than gdigrab.
+            // Falls back to gdigrab if ddagrab is unavailable (older Windows/drivers).
+            const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
+            args << "-thread_queue_size" << "512"
+                 << "-f" << "lavfi"
+                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
+                              .arg(screenIdx).arg(fps);
             return args;
 #elif defined(Q_OS_MACOS)
             QStringList args;
@@ -265,7 +259,8 @@ QStringList audioInputArgsFor(const Source& s) {
     if (id.isEmpty()) return args;
 
 #if defined(Q_OS_WIN)
-    args << "-f" << "dshow" << "-i" << QString("audio=%1").arg(id);
+    args << "-thread_queue_size" << "512"
+         << "-f" << "dshow" << "-i" << QString("audio=%1").arg(id);
 #elif defined(Q_OS_MACOS)
     args << "-f" << "avfoundation" << "-i" << QString(":%1").arg(id);
 #else
