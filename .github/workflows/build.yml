@@ -79,6 +79,15 @@ jobs:
               "$stage/VolchayObs.exe"
           Get-ChildItem $stage -Recurse | Select-Object FullName, Length
 
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName "stage/VolchayObs/ffmpeg.exe"
+
       - name: Create zip
         shell: pwsh
         run: |
