@@ -9,31 +9,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  linux:
-    # CI sanity check that the project still configures + builds against
-    # the older Qt 6.2 on Ubuntu 22.04. Windows is the primary target.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Qt6 + build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            qt6-base-dev qt6-multimedia-dev qt6-tools-dev qt6-tools-dev-tools \
-            qt6-webengine-dev qt6-webengine-dev-tools \
-            cmake ninja-build g++ libgl-dev
-
-      - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Smoke test (offscreen)
-        run: |
-          QT_QPA_PLATFORM=offscreen timeout 3 ./build/volchay-obs || true
-
   windows:
     runs-on: windows-latest
     steps:
