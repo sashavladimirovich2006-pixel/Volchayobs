@@ -285,28 +285,42 @@ QStringList audioInputArgsFor(const Source& s) {
 
 StreamEngine::StreamEngine(QObject* parent)
     : QObject(parent),
-      m_proc(new QProcess(this)),
+      m_muxProc(new QProcess(this)),
+      m_captureProc(new QProcess(this)),
       m_terminateTimer(new QTimer(this)),
       m_killTimer(new QTimer(this)) {
-    m_proc->setProcessChannelMode(QProcess::SeparateChannels);
-    connect(m_proc, &QProcess::readyReadStandardError,
-            this, &StreamEngine::onReadyReadStandardError);
-    connect(m_proc, &QProcess::finished,
-            this, &StreamEngine::onFinished);
-    connect(m_proc, &QProcess::errorOccurred,
-            this, &StreamEngine::onErrorOccurred);
+    m_muxProc->setProcessChannelMode(QProcess::SeparateChannels);
+    m_captureProc->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(m_muxProc, &QProcess::readyReadStandardError,
+            this, &StreamEngine::onMuxReadyReadStandardError);
+    connect(m_captureProc, &QProcess::readyReadStandardError,
+            this, &StreamEngine::onCaptureReadyReadStandardError);
+    connect(m_muxProc, &QProcess::finished,
+            this, &StreamEngine::onMuxFinished);
+    connect(m_captureProc, &QProcess::finished,
+            this, &StreamEngine::onCaptureFinished);
+    connect(m_muxProc, &QProcess::errorOccurred,
+            this, &StreamEngine::onProcessErrorOccurred);
+    connect(m_captureProc, &QProcess::errorOccurred,
+            this, &StreamEngine::onProcessErrorOccurred);
 
     m_terminateTimer->setSingleShot(true);
     m_killTimer->setSingleShot(true);
     connect(m_terminateTimer, &QTimer::timeout, this, [this] {
-        if (m_proc->state() == QProcess::Running) {
-            m_proc->terminate();
-            m_killTimer->start(2000);
+        if (m_muxProc->state() == QProcess::Running) {
+            m_muxProc->terminate();
         }
+        if (m_captureProc->state() == QProcess::Running) {
+            m_captureProc->terminate();
+        }
+        m_killTimer->start(2000);
     });
     connect(m_killTimer, &QTimer::timeout, this, [this] {
-        if (m_proc->state() == QProcess::Running) {
-            m_proc->kill();
+        if (m_muxProc->state() == QProcess::Running) {
+            m_muxProc->kill();
+        }
+        if (m_captureProc->state() == QProcess::Running) {
+            m_captureProc->kill();
         }
     });
 }
@@ -314,9 +328,11 @@ StreamEngine::StreamEngine(QObject* parent)
 StreamEngine::~StreamEngine() {
     m_terminateTimer->stop();
     m_killTimer->stop();
-    if (m_proc->state() != QProcess::NotRunning) {
-        m_proc->kill();
-        m_proc->waitForFinished(2000);
+    for (QProcess* p : { m_muxProc, m_captureProc }) {
+        if (p->state() != QProcess::NotRunning) {
+            p->kill();
+            p->waitForFinished(2000);
+        }
     }
 }
 
@@ -325,14 +341,17 @@ void StreamEngine::setFfmpegPath(const QString& path) {
 }
 
 bool StreamEngine::isRunning() const {
-    return m_proc->state() == QProcess::Running;
+    return m_muxProc->state() == QProcess::Running
+        || m_captureProc->state() == QProcess::Running;
 }
 
-QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
-                                          const StreamTarget& target,
-                                          const SourceList& sources,
-                                          QString* failureReason) {
-    auto fail = [&](const QString& msg) -> QStringList {
+StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
+        const StreamConfig& cfg,
+        const StreamTarget& target,
+        const SourceList& sources,
+        QString* failureReason) {
+    FfmpegPlan plan;
+    auto fail = [&](const QString& msg) -> FfmpegPlan {
         if (failureReason) *failureReason = msg;
         return {};
     };
@@ -347,13 +366,8 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     QStringList videoArgs = videoInputArgsFor(sources[videoIdx], cfg, &videoFail);
     if (videoArgs.isEmpty()) return fail(videoFail);
 
-    QStringList args;
-    args << "-hide_banner" << "-loglevel" << "info";
-    args << videoArgs;
-
-    // Collect every enabled audio source. MediaFile carries audio inline,
-    // so we enable that pass-through when it's the primary video source.
-    QList<int> audioInputs; // indices in `sources`
+    // Collect every enabled native audio source.
+    QList<int> audioInputs;
     for (int i = 0; i < sources.size(); ++i) {
         const Source& s = sources[i];
         if (!s.enabled) continue;
@@ -361,38 +375,25 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
             audioInputs.push_back(i);
         }
     }
-    int audioInputCount = 0;
-    constexpr int firstAudioInputIndex = 1; // video is always input 0
 
-    // Append each native audio device as its own ffmpeg input.
-    for (int i : audioInputs) {
-        const QStringList a = audioInputArgsFor(sources[i]);
-        if (!a.isEmpty()) {
-            args << a;
-            ++audioInputCount;
-        }
-    }
+    const bool primaryHasAudio = (sources[videoIdx].type == SourceType::MediaFile);
 
-    // If the primary source is a media file or test pattern with audio,
-    // and the user didn't explicitly add audio sources, lift the audio
-    // straight from input 0 so the output isn't silent.
-    bool primaryHasAudio = false;
-    if (sources[videoIdx].type == SourceType::MediaFile) {
-        primaryHasAudio = true;
-    }
-    if (audioInputCount == 0 && sources[videoIdx].type == SourceType::TestPattern) {
-        // testsrc2 doesn't carry audio — synthesise a sine tone so the FLV
-        // muxer doesn't choke and Twitch's player still has a track.
-        args << "-f" << "lavfi"
-             << "-i" << QString("sine=frequency=440:sample_rate=%1")
-                            .arg(cfg.audioSampleRateHz);
-        ++audioInputCount;
-    }
+    // Decide whether we need the two-process split pipeline. On Windows
+    // with ddagrab in a lavfi source AND any dshow audio in the same
+    // ffmpeg, the lavfi pull thread stalls (proven empirically: no audio
+    // = 60fps; two mics + amix = 6fps; the video encoder itself runs
+    // > 1.0x speed throughout, so it isn't the bottleneck). Splitting
+    // capture and mux into separate processes gives the capture loop
+    // sole ownership of the ddagrab pull and the audio handling stays
+    // on a second ffmpeg that just reads pre-encoded video off stdin.
+    const bool isDisplayCapture =
+        (sources[videoIdx].type == SourceType::DisplayCapture);
+    bool useTwoProcess = false;
+#if defined(Q_OS_WIN)
+    useTwoProcess = isDisplayCapture && !audioInputs.isEmpty();
+#endif
 
-    // Build the audio routing. We always go through filter_complex when
-    // there's at least one audio input so per-source volume sliders
-    // (Source.settings[AUDIO_VOLUME]) take effect — both for a single
-    // input and for the multi-input amix case.
+    // ---- Volume helper (shared) ----
     auto volumeFor = [](const Source& s) {
         const QVariant v = s.settings.value(SourceFields::AUDIO_VOLUME, 1.0);
         bool ok = false;
@@ -400,9 +401,184 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
         if (!ok) d = 1.0;
         return qBound(0.0, d, 4.0);
     };
+
+    // ---- Decide if video filter is needed on the encode side ----
+    bool encoderSeesD3D11 = false;
+    QString videoFilter;
+#if defined(Q_OS_WIN)
+    {
+        const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
+        bool needsScale = true;
+        if (isDisplayCapture) {
+            const auto screens = enumerateScreens();
+            const int sIdx = sources[videoIdx]
+                .settings.value(SourceFields::SCREEN_INDEX, 0).toInt();
+            if (sIdx >= 0 && sIdx < screens.size()) {
+                const auto& sc = screens[sIdx];
+                needsScale = (sc.w != cfg.widthPx || sc.h != cfg.heightPx);
+            }
+        }
+        if (isNvenc && isDisplayCapture && !needsScale) {
+            encoderSeesD3D11 = true;
+        } else if (isDisplayCapture) {
+            videoFilter = needsScale
+                ? QString("hwdownload,format=bgra,scale=%1:%2:flags=bilinear,format=yuv420p")
+                      .arg(cfg.widthPx).arg(cfg.heightPx)
+                : QStringLiteral("hwdownload,format=bgra,format=yuv420p");
+        }
+    }
+#endif
+
+    // ---- Helper: append encoder settings to an arg list ----
+    auto appendVideoEncoder = [&](QStringList& a) {
+        a << "-c:v" << encoderName(cfg.encoder);
+        if (cfg.encoder == Encoder::X264) {
+            a << "-preset" << cfg.x264Preset
+              << "-profile:v" << cfg.profile
+              << "-tune" << "zerolatency";
+        } else if (cfg.encoder == Encoder::NVENC_H264) {
+            a << "-tune" << "ll";
+        }
+        if (!encoderSeesD3D11) {
+            a << "-pix_fmt" << "yuv420p";
+        }
+        a << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
+          << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
+          << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec);
+        const QString rcMode = rateControlMode(cfg.rateControl, cfg.encoder);
+        if (cfg.encoder == Encoder::X264) {
+            if (cfg.rateControl == RateControl::CBR) {
+                a << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps)
+                  << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2)
+                  << "-x264-params"
+                  << QString("nal-hrd=cbr:keyint=%1:min-keyint=%1")
+                         .arg(cfg.fps * cfg.keyframeIntervalSec);
+            } else if (cfg.rateControl == RateControl::VBR) {
+                a << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps * 3 / 2)
+                  << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
+            } else {
+                a << "-crf" << QStringLiteral("23");
+            }
+        } else {
+            a << "-rc" << rcMode;
+            if (cfg.rateControl == RateControl::CBR) {
+                a << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps)
+                  << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
+            } else if (cfg.rateControl == RateControl::VBR) {
+                a << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps * 3 / 2)
+                  << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
+            }
+        }
+    };
+
+    QString rtmpFull = target.rtmpUrl;
+    if (!rtmpFull.endsWith('/')) rtmpFull += '/';
+    rtmpFull += target.streamKey;
+
+    // ===== Branch A: two-process pipeline (Windows + audio) =====
+    if (useTwoProcess) {
+        // ----- Capture process -----
+        // Reads ddagrab → optional -vf → encode → MPEG-TS on stdout.
+        // No audio anywhere in this process, so the lavfi pull thread
+        // is never starved.
+        QStringList& cap = plan.captureArgs;
+        cap << "-hide_banner" << "-loglevel" << "info";
+        cap << videoArgs;
+        cap << "-map" << "0:v";
+        if (!videoFilter.isEmpty()) cap << "-vf" << videoFilter;
+        appendVideoEncoder(cap);
+        // MPEG-TS is the standard ffmpeg-to-ffmpeg streaming container —
+        // it has self-describing timestamps and survives mid-stream
+        // resync, unlike raw H.264 or FLV.
+        cap << "-f" << "mpegts" << "pipe:1";
+
+        // ----- Mux process -----
+        // Reads encoded video from stdin (input 0), then dshow audio
+        // (inputs 1, 2, ...), mixes audio with the same filter graph
+        // we used in the single-process path, and writes to RTMP.
+        QStringList& mux = plan.muxArgs;
+        mux << "-hide_banner" << "-loglevel" << "info";
+        mux << "-f" << "mpegts" << "-i" << "pipe:0";
+
+        int audioInputCount = 0;
+        constexpr int firstAudioInputIndex = 1; // video is input 0 (pipe)
+        for (int i : audioInputs) {
+            const QStringList a = audioInputArgsFor(sources[i]);
+            if (!a.isEmpty()) {
+                mux << a;
+                ++audioInputCount;
+            }
+        }
+        if (audioInputCount > 0) {
+            QString filter;
+            QStringList branchLabels;
+            int branchIdx = 0;
+            for (int j = 0; j < audioInputCount; ++j) {
+                const int inputIdx = firstAudioInputIndex + j;
+                double vol = 1.0;
+                int counted = 0;
+                for (int i : audioInputs) {
+                    if (audioInputArgsFor(sources[i]).isEmpty()) continue;
+                    if (counted == j) { vol = volumeFor(sources[i]); break; }
+                    ++counted;
+                }
+                const QString label = QString("[a%1]").arg(branchIdx++);
+                filter += QString("[%1:a]aresample=async=1,volume=%2")
+                              .arg(inputIdx).arg(QString::number(vol, 'f', 3))
+                       + label + ";";
+                branchLabels << label;
+            }
+            if (branchLabels.size() == 1) {
+                filter.chop(branchLabels.first().size() + 1);
+                filter += QStringLiteral("[aout];");
+            } else {
+                filter += branchLabels.join("")
+                       + QString("amix=inputs=%1:duration=longest:dropout_transition=0[aout];")
+                             .arg(branchLabels.size());
+            }
+            if (filter.endsWith(';')) filter.chop(1);
+            mux << "-filter_complex" << filter;
+            mux << "-map" << "0:v:0" << "-map" << "[aout]";
+        } else {
+            mux << "-map" << "0:v:0";
+        }
+
+        // Video is already encoded — copy it through without re-encoding.
+        mux << "-c:v" << "copy";
+        if (audioInputCount > 0) {
+            mux << "-c:a" << "aac"
+                << "-b:a" << QString("%1k").arg(cfg.audioBitrateKbps)
+                << "-ar" << QString::number(cfg.audioSampleRateHz)
+                << "-ac" << "2";
+        }
+        mux << "-f" << "flv" << rtmpFull;
+        return plan;
+    }
+
+    // ===== Branch B: single-process pipeline =====
+    QStringList& args = plan.muxArgs;
+    args << "-hide_banner" << "-loglevel" << "info";
+    args << videoArgs;
+
+    int audioInputCount = 0;
+    constexpr int firstAudioInputIndex = 1; // video is input 0
+    for (int i : audioInputs) {
+        const QStringList a = audioInputArgsFor(sources[i]);
+        if (!a.isEmpty()) {
+            args << a;
+            ++audioInputCount;
+        }
+    }
+    if (audioInputCount == 0 && sources[videoIdx].type == SourceType::TestPattern) {
+        args << "-f" << "lavfi"
+             << "-i" << QString("sine=frequency=440:sample_rate=%1")
+                            .arg(cfg.audioSampleRateHz);
+        ++audioInputCount;
+    }
+
     QString audioMap;
     if (audioInputCount == 0 && !primaryHasAudio) {
-        // no audio at all
+        // no audio
     } else if (audioInputCount == 0 && primaryHasAudio) {
         audioMap = QStringLiteral("0:a?");
     } else {
@@ -416,9 +592,6 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
         }
         for (int j = 0; j < audioInputCount; ++j) {
             const int inputIdx = firstAudioInputIndex + j;
-            // Match `inputIdx` back to its Source so we can pick up the
-            // user's volume slider; fall back to 1.0 if we can't find it
-            // (e.g. the synthesised sine for TestPattern with no mic).
             double vol = 1.0;
             int counted = 0;
             for (int i : audioInputs) {
@@ -427,22 +600,13 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
                 ++counted;
             }
             const QString label = QString("[a%1]").arg(branchIdx++);
-            // aresample=async=1 stretches/skips samples to keep each branch
-            // monotonic — without it, dshow on Windows hands amix audio
-            // chunks whose PTSs jump backward (the two mics start ~0.5s
-            // apart and never align cleanly). The chaotic amix output then
-            // back-pressures the output mux and the video pull thread
-            // stops draining ddagrab at 60Hz, dropping unique frames to
-            // ~7fps even though the encoder runs at 1.2x realtime.
             filter += QString("[%1:a]aresample=async=1,volume=%2")
                           .arg(inputIdx).arg(QString::number(vol, 'f', 3))
                    + label + ";";
             branchLabels << label;
         }
         if (branchLabels.size() == 1) {
-            // Single branch — just rewrite the label to [aout] so we don't
-            // pay the cost of a 1-input amix.
-            filter.chop(branchLabels.first().size() + 1); // drop "[aN];"
+            filter.chop(branchLabels.first().size() + 1);
             filter += QStringLiteral("[aout];");
         } else {
             filter += branchLabels.join("")
@@ -454,115 +618,18 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
         audioMap = QStringLiteral("[aout]");
     }
 
-    args << "-map" << QStringLiteral("0:v");
+    args << "-map" << "0:v";
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
-
-    // ---- Video filter: convert d3d11 frames from ddagrab ----
-    // h264_nvenc accepts AV_PIX_FMT_D3D11 directly when capture size
-    // matches output (zero-copy, no -vf). For resize or non-NVENC encoders
-    // we hwdownload to system memory and scale on CPU with bilinear.
-    bool encoderSeesD3D11 = false;
-#if defined(Q_OS_WIN)
-    {
-        const Source& vsrc = sources[videoIdx];
-        const bool isDisplayCapture = (vsrc.type == SourceType::DisplayCapture);
-        const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
-
-        bool needsScale = true;
-        if (isDisplayCapture) {
-            const auto screens = enumerateScreens();
-            const int sIdx = vsrc.settings.value(SourceFields::SCREEN_INDEX, 0).toInt();
-            if (sIdx >= 0 && sIdx < screens.size()) {
-                const auto& sc = screens[sIdx];
-                needsScale = (sc.w != cfg.widthPx || sc.h != cfg.heightPx);
-            }
-        }
-
-        if (isNvenc && isDisplayCapture && !needsScale) {
-            encoderSeesD3D11 = true;
-        } else if (isDisplayCapture) {
-            if (needsScale) {
-                args << "-vf"
-                     << QString("hwdownload,format=bgra,scale=%1:%2:flags=bilinear,format=yuv420p")
-                            .arg(cfg.widthPx).arg(cfg.heightPx);
-            } else {
-                args << "-vf" << QStringLiteral("hwdownload,format=bgra,format=yuv420p");
-            }
-        }
-    }
-#endif
-
-    // ---- Video encoder ----
-    args << "-c:v" << encoderName(cfg.encoder);
-    if (cfg.encoder == Encoder::X264) {
-        args << "-preset" << cfg.x264Preset
-             << "-profile:v" << cfg.profile
-             << "-tune" << "zerolatency";
-    } else if (cfg.encoder == Encoder::NVENC_H264) {
-        // -tune ll = low-latency: drops B-frames and look-ahead, which is
-        // both the right choice for live streaming (lower glass-to-glass)
-        // and removes one possible source of pipeline back-pressure
-        // (encoder holding frames waiting on lookahead).
-        args << "-tune" << "ll";
-    }
-    // Skip -pix_fmt when the encoder receives a d3d11 hwframe — emitting
-    // it would force FFmpeg to insert a software format=yuv420p filter
-    // which can't consume hwframes ("Impossible to convert between the
-    // formats supported by ... and 'auto_scale_0'"). NVENC handles the
-    // pixel-format choice itself in that path.
-    if (!encoderSeesD3D11) {
-        args << "-pix_fmt" << "yuv420p";
-    }
-    // No explicit -r: with -r enforcing 60 fps CFR, ffmpeg synthesises
-    // duplicate frames whenever the input's PTS gap exceeds 1/60 sec.
-    // Letting the output rate float matches whatever ddagrab actually
-    // delivers (60 fps when healthy, lower if main thread is starved by
-    // audio) — at least Twitch sees honest content instead of a fake
-    // 60 fps stream that's 90 percent duplicates.
-    args << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
-         << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
-         << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec);
-
-    const QString rcMode = rateControlMode(cfg.rateControl, cfg.encoder);
-    if (cfg.encoder == Encoder::X264) {
-        if (cfg.rateControl == RateControl::CBR) {
-            args << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps)
-                 << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2)
-                 << "-x264-params"
-                 << QString("nal-hrd=cbr:keyint=%1:min-keyint=%1")
-                        .arg(cfg.fps * cfg.keyframeIntervalSec);
-        } else if (cfg.rateControl == RateControl::VBR) {
-            args << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps * 3 / 2)
-                 << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
-        } else {
-            args << "-crf" << QStringLiteral("23");
-        }
-    } else {
-        args << "-rc" << rcMode;
-        if (cfg.rateControl == RateControl::CBR) {
-            args << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps)
-                 << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
-        } else if (cfg.rateControl == RateControl::VBR) {
-            args << "-maxrate" << QString("%1k").arg(cfg.videoBitrateKbps * 3 / 2)
-                 << "-bufsize" << QString("%1k").arg(cfg.videoBitrateKbps * 2);
-        }
-    }
-
-    // ---- Audio encoder ----
+    if (!videoFilter.isEmpty()) args << "-vf" << videoFilter;
+    appendVideoEncoder(args);
     if (!audioMap.isEmpty()) {
         args << "-c:a" << "aac"
              << "-b:a" << QString("%1k").arg(cfg.audioBitrateKbps)
              << "-ar" << QString::number(cfg.audioSampleRateHz)
              << "-ac" << "2";
     }
-
-    // ---- Output (RTMP) ----
-    QString rtmpFull = target.rtmpUrl;
-    if (!rtmpFull.endsWith('/')) rtmpFull += '/';
-    rtmpFull += target.streamKey;
     args << "-f" << "flv" << rtmpFull;
-
-    return args;
+    return plan;
 }
 
 void StreamEngine::start(const StreamConfig& cfg,
@@ -578,42 +645,80 @@ void StreamEngine::start(const StreamConfig& cfg,
     }
 
     QString reason;
-    const QStringList args = buildFfmpegArgs(cfg, target, sources, &reason);
-    if (args.isEmpty()) {
+    const FfmpegPlan plan = buildFfmpegPlan(cfg, target, sources, &reason);
+    if (plan.muxArgs.isEmpty()) {
         emit errorOccurred(reason.isEmpty()
             ? tr("Video source is not configured.") : reason);
         return;
     }
 
-    QStringList loggable = args;
-    if (!loggable.isEmpty()) {
-        loggable.last() = QStringLiteral("<rtmp-url-with-stream-key-hidden>");
-    }
-    emit logLine(QStringLiteral("$ ffmpeg ") + loggable.join(' '));
-    m_proc->setProgram(m_ffmpegPath.isEmpty() ? findFfmpeg() : m_ffmpegPath);
-    m_proc->setArguments(args);
+    auto logCmd = [&](const QString& prefix, QStringList a) {
+        if (!a.isEmpty() && a.last().startsWith(QStringLiteral("rtmp"))) {
+            a.last() = QStringLiteral("<rtmp-url-with-stream-key-hidden>");
+        }
+        emit logLine(prefix + a.join(' '));
+    };
+
+    const QString ffmpegExe =
+        m_ffmpegPath.isEmpty() ? findFfmpeg() : m_ffmpegPath;
     m_swallowProcessErrors = true;
-    m_proc->start();
-    const bool ok = m_proc->waitForStarted(3000);
-    m_swallowProcessErrors = false;
-    if (!ok) {
-        emit errorOccurred(tr("Failed to launch ffmpeg. Make sure ffmpeg is installed and on PATH."));
-        return;
+
+    if (!plan.captureArgs.isEmpty()) {
+        // Two-process: capture | mux. Qt wires up the pipe for us via
+        // setStandardOutputProcess — m_captureProc's stdout becomes
+        // m_muxProc's stdin.
+        logCmd(QStringLiteral("$ ffmpeg [capture] "), plan.captureArgs);
+        logCmd(QStringLiteral("$ ffmpeg [mux] "), plan.muxArgs);
+        m_captureProc->setProgram(ffmpegExe);
+        m_captureProc->setArguments(plan.captureArgs);
+        m_muxProc->setProgram(ffmpegExe);
+        m_muxProc->setArguments(plan.muxArgs);
+        m_captureProc->setStandardOutputProcess(m_muxProc);
+        m_captureProc->start();
+        m_muxProc->start();
+        const bool okCap = m_captureProc->waitForStarted(3000);
+        const bool okMux = m_muxProc->waitForStarted(3000);
+        m_swallowProcessErrors = false;
+        if (!okCap || !okMux) {
+            if (m_captureProc->state() == QProcess::Running) m_captureProc->kill();
+            if (m_muxProc->state() == QProcess::Running) m_muxProc->kill();
+            emit errorOccurred(tr("Failed to launch ffmpeg. Make sure ffmpeg is installed and on PATH."));
+            return;
+        }
+    } else {
+        // Single-process path (no audio, or non-Windows, or non-DisplayCapture).
+        logCmd(QStringLiteral("$ ffmpeg "), plan.muxArgs);
+        m_muxProc->setProgram(ffmpegExe);
+        m_muxProc->setArguments(plan.muxArgs);
+        m_muxProc->start();
+        const bool ok = m_muxProc->waitForStarted(3000);
+        m_swallowProcessErrors = false;
+        if (!ok) {
+            emit errorOccurred(tr("Failed to launch ffmpeg. Make sure ffmpeg is installed and on PATH."));
+            return;
+        }
     }
     emit started();
 }
 
 void StreamEngine::stop() {
     if (!isRunning()) return;
-    m_proc->write("q\n");
+    // Send 'q' to mux first — it stops gracefully, closes its stdin,
+    // which makes the capture process see EOF and exit on its own.
+    if (m_muxProc->state() == QProcess::Running) {
+        m_muxProc->write("q\n");
+    }
+    if (m_captureProc->state() == QProcess::Running) {
+        m_captureProc->write("q\n");
+    }
     m_terminateTimer->start(3000);
 }
 
-void StreamEngine::onReadyReadStandardError() {
+void StreamEngine::onMuxReadyReadStandardError() {
     // ffmpeg prints its progress status as a single ever-updating line
     // separated by \r, not \n. We split on both so the UI can see live
     // updates without waiting for a newline that never arrives.
-    const QByteArray chunk = m_proc->readAllStandardError();
+    const QByteArray chunk = m_muxProc->readAllStandardError();
     QByteArray buf = chunk;
     buf.replace('\r', '\n');
     for (const QByteArray& line : buf.split('\n')) {
@@ -624,8 +729,6 @@ void StreamEngine::onReadyReadStandardError() {
         // Parse the running progress line, which looks like:
         //   frame= 1234 fps= 60 q=23.0 size=  12345kB time=00:00:20.55
         //   bitrate=4920.3kbits/s dup=0 drop=2 speed=1.00x
-        // Only fire statsUpdated when we see the canonical "frame=" line
-        // so other log noise doesn't reset the UI.
         if (!s.contains(QStringLiteral("frame=")) ||
             !s.contains(QStringLiteral("fps=")) ||
             !s.contains(QStringLiteral("bitrate="))) continue;
@@ -663,13 +766,41 @@ void StreamEngine::onReadyReadStandardError() {
     }
 }
 
-void StreamEngine::onFinished(int exitCode, QProcess::ExitStatus status) {
+void StreamEngine::onCaptureReadyReadStandardError() {
+    // Tag capture-side logs so the user can tell them apart from mux logs.
+    const QByteArray chunk = m_captureProc->readAllStandardError();
+    QByteArray buf = chunk;
+    buf.replace('\r', '\n');
+    for (const QByteArray& line : buf.split('\n')) {
+        const QString s = QString::fromUtf8(line).trimmed();
+        if (s.isEmpty()) continue;
+        // Skip the noisy `frame=...` progress lines from the capture
+        // side — the mux side's progress is what the user cares about
+        // (it reflects what's actually being shipped to Twitch).
+        if (s.startsWith(QStringLiteral("frame="))) continue;
+        emit logLine(QStringLiteral("[capture] ") + s);
+    }
+}
+
+void StreamEngine::onMuxFinished(int exitCode, QProcess::ExitStatus status) {
+    // If capture is still running, kill it — mux exiting means we're done
+    // streaming and we don't want a zombie producer.
+    if (m_captureProc->state() == QProcess::Running) {
+        m_captureProc->kill();
+        m_captureProc->waitForFinished(2000);
+    }
     m_terminateTimer->stop();
     m_killTimer->stop();
     emit stopped(exitCode, status);
 }
 
-void StreamEngine::onErrorOccurred(QProcess::ProcessError err) {
+void StreamEngine::onCaptureFinished(int /*exitCode*/, QProcess::ExitStatus /*status*/) {
+    // Capture process ending alone is fine — mux will see EOF on stdin
+    // and shut down on its own (which fires onMuxFinished, which emits
+    // the public stopped signal). Nothing to do here.
+}
+
+void StreamEngine::onProcessErrorOccurred(QProcess::ProcessError err) {
     if (m_swallowProcessErrors) return;
     QString msg;
     switch (err) {

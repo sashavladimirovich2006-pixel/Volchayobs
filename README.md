@@ -165,6 +165,71 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Двух-процессный pipeline: capture → mux через stdout-stdin pipe (десятая итерация)
+
+**Контекст и диагностика.** Юзер наконец прогнал бисект-тест:
+
+- ddagrab + RTMP **без аудио** → 60 fps clean. `dup=0`, `drop=35` (startup only).
+- ddagrab + 2 dshow audio + amix + RTMP → 3-7 fps.
+
+То есть **причина однозначно — dshow аудио**. Подтверждено эмпирически. Encoder во всех случаях бежал на `speed > 1.0x` (не bottleneck), aresample уже вычистил DTS warnings, никакие per-flag tweaks (gdigrab, wallclock, tune ll, rtbufsize) не помогали — потому что **проблема архитектурная**:
+
+ffmpeg в одном процессе пытается одновременно:
+1. **Опрашивать lavfi/ddagrab** (pull-driven, без своего потока, зависит от main loop).
+2. **Демультиплексировать два dshow-аудио потока** (COM-based, частые мелкие пакеты).
+3. **Прогонять amix-фильтр** (синхронизирует аудио).
+4. **Кодировать AAC**.
+5. **Кодировать H.264** через NVENC.
+6. **Писать в RTMP сокет**.
+
+Всё это **сериализуется в один main-thread**. Аудио-обработка по объёму операций доминирует, и lavfi pull (= вызов `request_frame` на ddagrab) случается раз в ~150 мс вместо раз в 16.6 мс. ddagrab выдаёт 6 уникальных кадров в секунду — не потому что DDA медленный, а потому что ffmpeg редко спрашивает.
+
+`-thread_queue_size 1024` тут не помогает — lavfi-источники не пишут во входную очередь, они отдают кадр прямо в момент pull. Этот флаг работает только для real demuxers (gdigrab, dshow, file). Поэтому gdigrab в седьмой итерации не помог: даже если ОН пишет в очередь, изменение наоборот сделало хуже — теперь и gdigrab, и dshow в одном main loop конкурируют за CPU.
+
+**Решение: разбить ffmpeg на два процесса**, соединённых через `stdout → stdin` pipe.
+
+```
+┌───────────────────────────┐         ┌─────────────────────────────┐
+│ capture ffmpeg            │         │ mux ffmpeg                  │
+│                           │         │                             │
+│  -f lavfi -i ddagrab=...  │         │  -f mpegts -i pipe:0        │
+│  [optional -vf]           │  pipe   │  -f dshow -i audio=mic1     │
+│  -c:v h264_nvenc -tune ll │ ──────► │  -f dshow -i audio=mic2     │
+│  -f mpegts pipe:1         │         │  -filter_complex            │
+│                           │         │    [1:a]aresample=...       │
+│                           │         │    [2:a]aresample=...       │
+│                           │         │    [a0][a1]amix...          │
+│                           │         │  -map 0:v -map [aout]       │
+│                           │         │  -c:v copy -c:a aac         │
+│                           │         │  -f flv rtmp://twitch       │
+└───────────────────────────┘         └─────────────────────────────┘
+```
+
+Capture-ffmpeg делает только видео — main loop не занят ничем кроме pull ddagrab + кодирование. ddagrab опрашивается 60 раз в секунду. Видео уходит в pipe в MPEG-TS контейнере (стандартный для ffmpeg-to-ffmpeg streaming, self-describing PTS-ы, переносит resync).
+
+Mux-ffmpeg читает MPEG-TS из stdin, обрабатывает аудио (демультиплекс dshow x2 + amix), копирует видеопоток без перекодирования (`-c:v copy` — нулевая нагрузка), кодирует AAC, пишет FLV в RTMP. Аудио-обработка теперь не конкурирует с ddagrab pull, потому что они в разных процессах с разными main loop'ами.
+
+**Что зашиваю в коде** (`src/StreamEngine.h` + `src/StreamEngine.cpp`):
+
+- **`StreamEngine` теперь держит два `QProcess`** (`m_captureProc` и `m_muxProc`) вместо одного. В single-process-режиме m_captureProc просто idle, всё работает через m_muxProc как раньше.
+- **`buildFfmpegArgs(...)` → `buildFfmpegPlan(...)`**, возвращает `FfmpegPlan { captureArgs, muxArgs }`. Если `captureArgs` пустой — это сигнал single-process пути. Если оба заполнены — two-process.
+- **Условие активации two-process**: `Q_OS_WIN && isDisplayCapture && hasAudioInputs`. Только тогда, когда мы точно знаем что узким местом будет lavfi-ddagrab. Для остальных случаев (нет аудио, не Windows, capture другого типа) — старый single-process путь, без overhead.
+- **Pipe** между процессами устанавливается через `QProcess::setStandardOutputProcess(m_muxProc)` на m_captureProc. Qt сам прорастит OS-level pipe.
+- **Lifecycle**: start() запускает оба, `q\n` шлётся mux'у (он закрывает stdin → capture видит EOF → сам выходит). stop() ladder: q → SIGTERM → SIGKILL применяется к обоим. Если capture упадёт первым — mux видит EOF stdin и сам останавливается. Если mux первым — onMuxFinished kill'ит capture (зомби не нужен).
+- **Stats parsing**: подписаны на stderr обоих, но прогресс-линию (`frame=... fps=... bitrate=...`) парсим только из mux (это то что реально уходит в Twitch). Capture stderr идёт в лог с префиксом `[capture]`.
+
+**Цена решения:**
+- Видеопоток кодируется **один раз** (в capture), потом просто копируется в mux (`-c:v copy`) — никакого двойного encoding overhead.
+- ~50-100ms доп. latency на pipe-буферизацию (MPEG-TS chunks ~188 байт каждый, pipe буфер 64KB на Windows). Незаметно для стримера.
+- RAM: +1 ffmpeg процесс (~30-50 MB).
+- CPU: примерно тот же что раньше (encode + decode-passthrough в mux ≈ encode в single).
+
+**Failure modes:**
+- Если ffmpeg-сборка не имеет MPEG-TS muxer/demuxer (крайне маловероятно — это базовая ffmpeg-фича).
+- Если Windows-pipe лимит достигается (64KB по умолчанию на anonymous pipe). На больших keyframe'ах теоретически возможна задержка, но 6 Mbps стрим = ~12 KB на 1/60s frame, pipe не должен переполняться.
+
+Десятая итерация. Это **архитектурное решение**, а не очередной флаг-tweak. Должно сработать.
+
 ### 2026-05-27 — `-tune ll` для NVENC + `-rtbufsize 64M` для dshow (девятая итерация)
 
 Контекст: предыдущая итерация (8-я) убрала `-r 60` для VFR-режима и откатилась с gdigrab на ddagrab. Юзер сказал «пуш» без нового лога — значит либо не помогло, либо ещё не тестировал. В любом случае пушу две конкретные правки, которые могут разблокировать pipeline.
