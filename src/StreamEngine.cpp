@@ -101,7 +101,7 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
             args << "-thread_queue_size" << "512"
                  << "-f" << "lavfi"
-                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2,hwdownload,format=bgra")
+                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
                               .arg(screenIdx).arg(fps);
             return args;
 #elif defined(Q_OS_MACOS)
@@ -436,6 +436,17 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
 
     args << "-map" << QStringLiteral("0:v");
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
+
+    // ---- Video filter: convert d3d11 frames from ddagrab ----
+#if defined(Q_OS_WIN)
+    const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
+    if (isNvenc) {
+        args << "-vf" << QString("scale_cuda=%1:%2:format=yuv420p")
+                             .arg(cfg.widthPx).arg(cfg.heightPx);
+    } else {
+        args << "-vf" << QStringLiteral("hwdownload,format=bgra");
+    }
+#endif
 
     // ---- Video encoder ----
     args << "-c:v" << encoderName(cfg.encoder);
