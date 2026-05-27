@@ -259,15 +259,8 @@ QStringList audioInputArgsFor(const Source& s) {
     if (id.isEmpty()) return args;
 
 #if defined(Q_OS_WIN)
-    // -use_wallclock_as_timestamps overrides dshow's PTS (which on Windows
-    // is system-uptime in seconds — e.g. 8163.5s on a machine that's been
-    // up 2 hours). Without this, ffmpeg tries to align video (starting at
-    // PTS=0) against audio (starting at PTS=N-thousand-seconds), which
-    // chokes the video pull-thread and ddagrab drops to ~7 unique fps
-    // (everything else gets duplicated up to the requested 60).
     args << "-thread_queue_size" << "1024"
          << "-f" << "dshow"
-         << "-use_wallclock_as_timestamps" << "1"
          << "-i" << QString("audio=%1").arg(id);
 #elif defined(Q_OS_MACOS)
     args << "-f" << "avfoundation" << "-i" << QString(":%1").arg(id);
@@ -423,8 +416,16 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
                 ++counted;
             }
             const QString label = QString("[a%1]").arg(branchIdx++);
-            filter += QString("[%1:a]volume=%2").arg(inputIdx)
-                          .arg(QString::number(vol, 'f', 3)) + label + ";";
+            // aresample=async=1 stretches/skips samples to keep each branch
+            // monotonic — without it, dshow on Windows hands amix audio
+            // chunks whose PTSs jump backward (the two mics start ~0.5s
+            // apart and never align cleanly). The chaotic amix output then
+            // back-pressures the output mux and the video pull thread
+            // stops draining ddagrab at 60Hz, dropping unique frames to
+            // ~7fps even though the encoder runs at 1.2x realtime.
+            filter += QString("[%1:a]aresample=async=1,volume=%2")
+                          .arg(inputIdx).arg(QString::number(vol, 'f', 3))
+                   + label + ";";
             branchLabels << label;
         }
         if (branchLabels.size() == 1) {
