@@ -483,25 +483,19 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // is never starved.
         QStringList& cap = plan.captureArgs;
         cap << "-hide_banner" << "-loglevel" << "info";
-        // `-stats` forces progress lines (`frame= fps= ...`) on stderr
-        // even when stderr is a pipe — without it ffmpeg suppresses them
-        // and we can't tell whether capture or mux is the one stalling.
-        cap << "-stats";
         cap << videoArgs;
         cap << "-map" << "0:v";
         if (!videoFilter.isEmpty()) cap << "-vf" << videoFilter;
         appendVideoEncoder(cap);
-        // Real-time MPEG-TS over a pipe needs muxer tuning. Default
-        // -muxdelay (0.7s) and -muxpreload (0.5s) buffer ~1.2s of video
-        // at the mpegts muxer before it'll flush, which on a 60fps stream
-        // means bursts of ~70 frames suddenly hit the pipe at once.
-        // -flush_packets 1 forces every packet straight out.
-        // NB: iter 13 also tried -mpegts_flags +nobuffer but that value
-        // doesn't exist on this mpegts muxer ("Undefined constant ... in
-        // 'nobuffer'") and broke capture entirely. Removed.
+        // Real-time MPEG-TS over a pipe: default muxdelay 0.7s and
+        // muxpreload 0.5s buffer ~1.2s of video inside mpegts muxer
+        // before flush, hitting the pipe in bursts. Zero them so packets
+        // leave the muxer as soon as they're produced.
+        // iter 14 rolled back: -flush_packets 1 (too aggressive — caused
+        // ~30k write() syscalls/sec at 188-byte mpegts packets) and -stats
+        // (didn't actually produce progress lines on this piped stderr).
         cap << "-muxdelay" << "0"
-            << "-muxpreload" << "0"
-            << "-flush_packets" << "1";
+            << "-muxpreload" << "0";
         // `-avoid_negative_ts make_zero` anchors the first packet at PTS 0
         // so the mux side doesn't see a video stream starting at 1.4s
         // while dshow audio starts at 15730s — that mismatch made mux
@@ -514,14 +508,15 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // (inputs 1, 2, ...), mixes audio with the same filter graph
         // we used in the single-process path, and writes to RTMP.
         QStringList& mux = plan.muxArgs;
-        mux << "-hide_banner" << "-loglevel" << "info" << "-stats";
+        mux << "-hide_banner" << "-loglevel" << "info";
         // `+genpts` regenerates PTS if any packet comes through without
         // one. `+igndts` keeps mux from stalling on dts jitter at startup.
-        // `+nobuffer` skips demuxer-level buffering (it was buffering audio
-        // until video caught up, which never happened because of the
-        // 15700s start delta). `+discardcorrupt` drops any packet that
-        // can't be aligned instead of stalling on it.
-        mux << "-fflags" << "+genpts+igndts+nobuffer+discardcorrupt";
+        // iter 14 rolled back: +nobuffer and +discardcorrupt made the
+        // first 4 seconds of stream show frame=0 (they dropped packets
+        // waiting for a sync'd keyframe that never arrived because of
+        // the dshow uptime offset). Net effect was strictly worse — the
+        // stall pattern persisted AND the initial latency grew.
+        mux << "-fflags" << "+genpts+igndts";
         // 16384 packets ≈ 4s of video burst headroom. Iter 12 used 4096
         // (~1s) and the stalls persisted, so we're overshooting hard to
         // rule out OS-pipe backpressure entirely.

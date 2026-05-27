@@ -165,6 +165,63 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Четырнадцатая итерация: откат регрессий 13.x, диагностический тупик
+
+**Контекст.** Хотфикс 13.2 запустил стрим (флаги наконец-то валидные), но **стало хуже чем в 12-й итерации**, не лучше:
+
+- Первые 4 секунды стрима mux показывает `frame=0` — `+nobuffer+discardcorrupt` агрессивно дропали ранние пакеты пока mux ждал «синхронизированный» keyframe от capture, который не наступал из-за 16979s offset dshow audio.
+- Stall pattern идентичен — frame=57 → 8 сек, frame=169 → 8 сек, frame=273 → 8 сек, frame=386 → 8 сек. Те же 8 секунд каждые ~110 фреймов.
+- mux speed=1.06x (едва успевает за реалтаймом).
+- `[capture]` progress-строки в логе **по-прежнему отсутствуют** даже с `-stats` — флаг проигнорировался ffmpeg-ом для piped stderr, либо съелся Logger'ом.
+- Юзер сообщил что **курсор мигает во время стрима** — это следствие нестабильного capture-fps (ddagrab frame-skipping). Не причина, а симптом.
+
+**Главное наблюдение из чисел в логе.** Колонка `time=` mux'а скачет неравномерно: иногда +3.5 секунды контента за +1 секунду wallclock (catch-up), иногда 0 секунд за +2 секунды wallclock (stall). Это **классический pipe-burst pattern**. Capture накапливает буфер, потом разом сваливает в pipe, mux переваривает, ждёт следующий burst.
+
+Поскольку capture-процесс архитектурно изолирован от audio (он не знает что есть audio), единственная связь — это **pipe back-pressure**. То есть mux читает pipe медленно (из-за audio sync), pipe заполняется, capture write() блокируется, ddagrab pull stalls.
+
+**Применённые откаты (итерация 14):**
+
+- Mux `-fflags +genpts+igndts+nobuffer+discardcorrupt` → `+genpts+igndts`. `+nobuffer` и `+discardcorrupt` сделали хуже: они отключали полезную buferization demuxer'а и дропали ранние пакеты соответственно.
+- Capture: убрано `-flush_packets 1`. Каждый mpegts-пакет 188 байт; flush_packets=1 значит каждый такой пакет вызывает отдельный `write()` в pipe. На 60fps + 6Mbps это ~30k syscalls/sec — CPU overhead который мог только усугубить burst pattern.
+- Capture+Mux: убрано `-stats`. Просто не работало — ни одной `[capture] frame=` строки не было ни в одном тесте. Возможно ffmpeg всё равно отключает их при non-TTY stderr, или Logger.cpp фильтрует.
+
+**Оставленные безопасные флаги (которые точно ничего не ломают):**
+
+- `-muxdelay 0 -muxpreload 0` на capture (убивает 1.2s буферизации mpegts).
+- `-fps_mode passthrough` на output mux (правильно для `-c:v copy`).
+- `-thread_queue_size 16384` на pipe input mux (4 сек headroom).
+- `-fflags +genpts+igndts` на mux.
+- `asetpts=N/SR/TB,aresample=async=1:first_pts=0` в filter_complex.
+
+**Тронутые файлы:** `src/StreamEngine.cpp`.
+
+**Что юзеру попробовать СЕЙЧАС (без новой сборки):**
+
+> **Бисект-тест — отключить второй микрофон в UI и запустить стрим.**
+>
+> Если с одним микрофоном пайплайн ровный 60fps → проблема в `amix` (синхронизация двух аудиопотоков с разным uptime offset). Тогда решение: вынести amix в отдельный процесс или использовать hardware mixer.
+>
+> Если с одним микрофоном тот же 8-секундный stall pattern → проблема глубже, в самом dshow + lavfi-pipe sync. Тогда решение: захватывать audio через `WasapiLoopback.cpp` напрямую, минуя ffmpeg-dshow.
+
+**Состояние гипотез после 14 итераций:**
+
+| Гипотеза | Применено в | Эффект |
+|---|---|---|
+| -tune ll для NVENC | 9 | Не помог |
+| -rtbufsize 64M для dshow | 9 | Не помог |
+| Two-process split | 10 | Частично — capture теперь 60fps, mux падает |
+| asetpts на audio | 11-12 | Не помог (PTS normalize ПОСЛЕ demuxer sync) |
+| -thread_queue_size 16384 | 12-14 | Не помог |
+| -muxdelay 0 -muxpreload 0 | 13 | Не вредит, возможно микро-улучшение |
+| +nobuffer +discardcorrupt | 13 (откачено) | Сделал хуже |
+| -flush_packets 1 | 13 (откачено) | Возможно сделал хуже |
+| -fps_mode passthrough | 13 | Не вредит |
+
+Накопленные данные говорят: **timestamp-нормализация и pipe-buffering — НЕ корень проблемы**. Остающиеся гипотезы:
+
+1. **CPU-bound audio processing** (aresample async + amix двух источников). Проверяется бисектом с одним микрофоном.
+2. **dshow + lavfi pipe demuxer-level sync** буферизует audio ожидая «недостающего» pipe video. Проверяется заменой dshow на WasapiLoopback.
+
 ### 2026-05-28 — Хотфикс 13.2: -fps_mode это output-опция, переехать к output
 
 Хотфикс 13.1 заменил `-vsync passthrough` на `-fps_mode passthrough`, но **поставил флаг ДО `-i pipe:0`** (на input-стороне). ffmpeg при парсинге аргументов привязывает каждую опцию к ближайшему следующему файлу — и попытался применить `-fps_mode` к input pipe:0:
