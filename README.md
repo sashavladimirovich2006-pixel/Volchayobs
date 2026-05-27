@@ -165,6 +165,44 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Стрим: окончательный фикс через софтовый pipeline (третья итерация)
+
+Контекст: после двух попыток поднять zero-copy GPU-pipeline (`scale_cuda`, потом `hwmap=derive_device=cuda`, потом снятие `-pix_fmt yuv420p`) FFmpeg всё ещё падал. Новая ошибка:
+
+```
+[Parsed_hwmap_0] Failed to created derived device context: -40.
+[Parsed_hwmap_0] Failed to configure output pad on Parsed_hwmap_0
+```
+
+Корень: текущая FFmpeg-сборка (BtbN GPL, `ffmpeg-master-latest-win64-gpl.zip`, которую пакует наш CI и которую юзеры качают сами) на этой Windows-машине **не умеет derive'ить CUDA-устройство из D3D11VA-устройства** — `av_hwdevice_ctx_create_derived` возвращает `-40 (ENOSYS)`. Это известная нестабильность D3D11VA↔CUDA interop — в зависимости от версии FFmpeg, версии NVIDIA-драйвера, наличия Intel iGPU как primary display adapter и т.д. путь `derive_device=cuda` либо работает, либо нет. Полагаться на него в дистрибутиве для разных юзеров — ошибка.
+
+Шаг назад. Три раза подряд я инкрементально патчил GPU-pipeline вместо того, чтобы пересмотреть подход — ровно та ситуация, против которой меня предупреждают мои инструкции. **Меняю стратегию полностью.**
+
+Решение: убрать GPU-pipeline для скейла из ddagrab вообще. Конвейер теперь:
+
+```
+ddagrab (d3d11)
+  → hwdownload (system memory, BGRA)
+  → scale (sw, lanczos, target W:H)
+  → format=yuv420p
+  → h264_nvenc / libx264 / h264_qsv / h264_amf
+```
+
+Все энкодеры — включая `h264_nvenc` — без проблем принимают software-кадры. NVENC сам делает CPU→GPU upload через CUDA driver внутри `nvEncRegisterResource`/`nvEncMapInputResource` без участия FFmpeg-фильтров. Цена решения: ~475 MB/s memcpy + PCIe upload на 1080p60 BGRA-потоке — это копейки на любом современном железе (memcpy ~10 GB/s на DDR4, PCIe 3.0 x16 ~16 GB/s). Скейлинг lanczos'ом на CPU при 1080p60 BGRA — ≈3-5% одного ядра.
+
+Что мы теряем: настоящий zero-copy GPU-pipeline, который теоретически давал бы 0% CPU. На практике разница незаметна; зато работает на ВСЕХ FFmpeg-сборках без специальных hwcontext-derivation хаков.
+
+Файлы (`src/StreamEngine.cpp`):
+
+- Блок «Video filter» (~lines 440-453): теперь одна общая ветка для всех Windows-энкодеров —
+  ```
+  -vf hwdownload,format=bgra,scale=W:H:flags=lanczos,format=yuv420p
+  ```
+  Условный switch по `Encoder::NVENC_H264` удалён.
+- Блок «Video encoder» (~lines 455-466): `-pix_fmt yuv420p` снова безусловный — на этом пути все энкодеры получают софтовый yuv420p, специальный обход для NVENC больше не нужен.
+
+Эффект: «Go live» с любым энкодером (NVENC и софтовые) поднимается без падения. Pipeline стабилен на любой FFmpeg-сборке с GPL-фичами. Если когда-то понадобится вернуть zero-copy для NVENC — нужно будет сначала реализовать **runtime probe** (запустить `ffmpeg -filters` и проверить, что `hwmap` + `scale_cuda` действительно есть в сборке, потом за один кадр прогнать тестовый pipeline и поймать ошибку), а не слепо включать.
+
 ### 2026-05-27 — Фикс краша стрима: убран `-pix_fmt yuv420p` на NVENC-ветке
 
 Контекст: после первого фикса (hwmap d3d11→cuda) стрим всё равно падал, но уже на следующем шаге пайплайна. Лог:

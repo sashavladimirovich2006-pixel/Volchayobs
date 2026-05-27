@@ -438,18 +438,17 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
 
     // ---- Video filter: convert d3d11 frames from ddagrab ----
-    // ddagrab outputs d3d11; scale_cuda needs cuda, and FFmpeg can't
-    // auto-bridge the two GPU contexts. hwmap=derive_device=cuda maps
-    // the D3D11 texture to a CUDA frame in-place (zero-copy).
+    // ddagrab gives us d3d11 hwframes; encoders (incl. NVENC) work fine
+    // with software frames, so we hwdownload to BGRA, scale to target
+    // resolution, and convert to yuv420p on CPU. We tried to keep a
+    // zero-copy GPU pipeline (hwmap=derive_device=cuda + scale_cuda),
+    // but hwmap fails on FFmpeg builds without D3D11VA→CUDA derivation
+    // ("Failed to created derived device context: -40"). The CPU path
+    // costs ~475 MB/s of memcpy at 1080p60 BGRA — negligible on modern
+    // hardware — and NVENC uploads to GPU internally on the way in.
 #if defined(Q_OS_WIN)
-    const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
-    if (isNvenc) {
-        args << "-vf" << QString("hwmap=derive_device=cuda,scale_cuda=%1:%2:format=yuv420p")
-                             .arg(cfg.widthPx).arg(cfg.heightPx);
-    } else {
-        args << "-vf" << QString("hwdownload,format=bgra,scale=%1:%2:flags=lanczos,format=yuv420p")
-                             .arg(cfg.widthPx).arg(cfg.heightPx);
-    }
+    args << "-vf" << QString("hwdownload,format=bgra,scale=%1:%2:flags=lanczos,format=yuv420p")
+                         .arg(cfg.widthPx).arg(cfg.heightPx);
 #endif
 
     // ---- Video encoder ----
@@ -459,13 +458,8 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
              << "-profile:v" << cfg.profile
              << "-tune" << "zerolatency";
     }
-    // For NVENC the filter chain ends in cuda(yuv420p) — emitting -pix_fmt
-    // makes FFmpeg insert a software format filter, which auto_scale can't
-    // bridge from a CUDA frame. h264_nvenc accepts the cuda hwframe as-is.
-    if (cfg.encoder != Encoder::NVENC_H264) {
-        args << "-pix_fmt" << "yuv420p";
-    }
-    args << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
+    args << "-pix_fmt" << "yuv420p"
+         << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
          << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-r" << QString::number(cfg.fps);
