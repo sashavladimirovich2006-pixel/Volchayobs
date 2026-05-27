@@ -459,8 +459,13 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
              << "-profile:v" << cfg.profile
              << "-tune" << "zerolatency";
     }
-    args << "-pix_fmt" << "yuv420p"
-         << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
+    // For NVENC the filter chain ends in cuda(yuv420p) — emitting -pix_fmt
+    // makes FFmpeg insert a software format filter, which auto_scale can't
+    // bridge from a CUDA frame. h264_nvenc accepts the cuda hwframe as-is.
+    if (cfg.encoder != Encoder::NVENC_H264) {
+        args << "-pix_fmt" << "yuv420p";
+    }
+    args << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
          << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-r" << QString::number(cfg.fps);

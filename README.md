@@ -165,6 +165,31 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Фикс краша стрима: убран `-pix_fmt yuv420p` на NVENC-ветке
+
+Контекст: после первого фикса (hwmap d3d11→cuda) стрим всё равно падал, но уже на следующем шаге пайплайна. Лог:
+
+```
+Impossible to convert between the formats supported by the filter
+'Parsed_scale_cuda_1' and the filter 'auto_scale_0'
+Link 'Parsed_scale_cuda_1.default' -> 'auto_scale_0.default':
+  src: cuda
+  dst: yuv420p yuyv422 rgb24 ... (software-форматы, без cuda)
+```
+
+Корень: после `scale_cuda=W:H:format=yuv420p` кадр всё ещё живёт в **CUDA-памяти** (это hwframe в layout'е yuv420p, а не software-yuv420p). Параметр `-pix_fmt yuv420p`, который мы безусловно навешивали на энкодер, заставляет FFmpeg вставить в конец фильтр-чейна софтовый `format=yuv420p`. Этот фильтр — software-only и принимает только CPU-кадры. FFmpeg пытается сам построить мост `cuda → yuv420p` через `auto_scale_0`, не находит конвертера (auto_scale умеет только software↔software) и падает с тем же `Impossible to convert between the formats`. Видеопоток ничего не пишет → `Could not open encoder before EOF` → `Conversion failed!`.
+
+Дополнительный нюанс: `h264_nvenc` умеет принимать CUDA-hwframe напрямую — значит явный `-pix_fmt yuv420p` для NVENC вообще лишний, формат уже задан через `scale_cuda=...:format=yuv420p`.
+
+Решение (`src/StreamEngine.cpp`, блок «Video encoder», ~lines 455-472):
+
+- `-pix_fmt yuv420p` теперь выставляется **только для софтовых энкодеров** (x264, QSV, AMF — туда кадр приходит через `hwdownload`, и pix_fmt действительно нужен).
+- Для `Encoder::NVENC_H264` флаг пропускается. Pipeline становится: `ddagrab (d3d11) → hwmap (cuda) → scale_cuda (cuda/yuv420p) → h264_nvenc` — без software-format-фильтра в конце, без auto_scale, без round-trip'а в RAM.
+
+Файлы: `src/StreamEngine.cpp` (одна правка в блоке энкодера).
+
+Эффект: «Go live» с NVENC поднимается полностью (RTMP-handshake → packets идут на Twitch с первой секунды), zero-copy GPU-pipeline сохранён, CPU не тратится на лишний format-фильтр.
+
 ### 2026-05-27 — Фикс краша стрима через 3 секунды: d3d11 → cuda мост для NVENC
 
 Контекст: после нажатия «Go live» FFmpeg-процесс отрабатывал ~3 секунды и падал с `Conversion failed!`. В логе видно ключевую строку:
