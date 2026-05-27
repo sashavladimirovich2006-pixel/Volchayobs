@@ -165,6 +165,38 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Двенадцатая итерация: asetpts всё-таки попал в two-process путь + увеличен thread_queue_size на pipe
+
+**Контекст.** Одиннадцатая итерация декларировала «`asetpts=N/SR/TB` добавлен в filter_complex для всех dshow-входов». На деле это было правдой только для **single-process** ветки. Two-process ветка собирала `filter_complex` отдельным кодом (две почти идентичные `filter += QString("[%1:a]aresample=...")` строки в `buildFfmpegPlan`), и Edit с `replace_all` пропустил one из вхождений — заменилась только строка single-process пути (строка ~624), а строка two-process пути (~536) осталась со старым `aresample=async=1,volume=...` без asetpts.
+
+Юзер протестировал коммит `cce2268` с двумя микрофонами (FIFINE + VXE V1) — стрим запустился, но fps снова падал с 150 до 24 по тому же паттерну («frame=413» застрял на 8 секунд, потом скачок к 533, опять 8 секунд, скачок к 664...). В логе command-line mux'а явно видно отсутствие asetpts:
+
+```
+-filter_complex [1:a]aresample=async=1,volume=0.970[a0];
+                [2:a]aresample=async=1,volume=0.970[a1];
+                [a0][a1]amix=inputs=2:duration=longest:dropout_transition=0[aout]
+```
+
+Plus у обоих dshow входов огромный start (14969s, 14970s — uptime от boot). То есть фикс одиннадцатой итерации не сработал по тривиальной причине: его в коде не было в нужной ветке.
+
+**Решение.**
+
+1. **Дописан asetpts в two-process branch (строка 536):**
+   ```cpp
+   filter += QString("[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=%2")
+                 .arg(inputIdx).arg(QString::number(vol, 'f', 3))
+            + label + ";";
+   ```
+   Теперь обе ветки строят идентичный audio sub-graph. Жирный комментарий в коде поясняет, почему это вторая итерация одного и того же изменения, чтобы будущий рефакторер не повторил ту же ошибку.
+
+2. **На mux добавлено `-thread_queue_size 4096` перед `-f mpegts -i pipe:0`.** До этого pipe input в mux не имел `-thread_queue_size`, и при первом же буфер-всплеске aresample-фильтра OS-pipe заполнялся → write() в capture блокировался → ddagrab pull stalled → frame freeze на 8 секунд. 4096 пакетов ≈ 0.7s видео на 60fps — достаточно чтобы amortize burst'ы amix-фильтра до того как они дойдут до capture.
+
+**Тронутые файлы:** `src/StreamEngine.cpp`.
+
+**Эффект для пользователя.** mux реально получает аудио с PTS от 0 (а не от 14969s), пайплайн не блокируется на синхронизации, capture не stall'ится → fps стабильный 60 на выходе. Это то, что предполагалось одиннадцатой итерацией, но из-за моего bug'а в Edit не было применено.
+
+**Урок на будущее.** Когда `replace_all=true` отчитывается «All occurrences were successfully replaced» — не доверять отчёту в одно слово, обязательно перечитывать обе позиции файла (Grep по новой подстроке). См. также [[feedback-readme-devlog]].
+
 ### 2026-05-27 — Фикс таймстампов в two-process pipeline (одиннадцатая итерация)
 
 **Контекст и диагностика.** Десятая итерация (split на capture + mux через mpegts pipe) частично сработала — capture стабильно выдаёт 60 fps lavfi/ddagrab, но **mux fps падает с 149 до 27** и зависает пачками («frame=413» повторяется 8 секунд → потом скачок к 532 → опять 8 секунд застоя → 647 ...). Плюс при добавлении desktop-audio источника стрим крашится.

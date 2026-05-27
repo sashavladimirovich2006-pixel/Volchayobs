@@ -508,6 +508,13 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // stalling on dts jitter at startup before dshow has begun
         // producing audio.
         mux << "-fflags" << "+genpts+igndts";
+        // 4096 packets ≈ 0.7s of video at 60fps — plenty of headroom so
+        // that even if mux briefly back-pressures on aresample buffer
+        // build-up, the OS pipe never fills and capture-side write()
+        // doesn't block (the failure mode in iter 10-11 logs: frame=413
+        // sticking for 8 seconds while mux churned through accumulated
+        // audio).
+        mux << "-thread_queue_size" << "4096";
         mux << "-f" << "mpegts" << "-i" << "pipe:0";
 
         int audioInputCount = 0;
@@ -533,7 +540,16 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
                     ++counted;
                 }
                 const QString label = QString("[a%1]").arg(branchIdx++);
-                filter += QString("[%1:a]aresample=async=1,volume=%2")
+                // asetpts=N/SR/TB rewrites the audio PTS from sample count,
+                // wiping out the absolute dshow uptime offset (observed:
+                // start=14970s vs video pipe start=0s, a 4-hour gap that
+                // froze mux trying to sync). aresample=async=1:first_pts=0
+                // then locks the first output sample to PTS=0.
+                // NB: 11-я итерация добавила asetpts только в single-process
+                // ветке — Edit с replace_all пропустил это вхождение, и
+                // two-process путь продолжал заикаться. Двенадцатая —
+                // именно это и чинит.
+                filter += QString("[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=%2")
                               .arg(inputIdx).arg(QString::number(vol, 'f', 3))
                        + label + ";";
                 branchLabels << label;
