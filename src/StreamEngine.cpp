@@ -489,7 +489,12 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         appendVideoEncoder(cap);
         // MPEG-TS is the standard ffmpeg-to-ffmpeg streaming container —
         // it has self-describing timestamps and survives mid-stream
-        // resync, unlike raw H.264 or FLV.
+        // resync, unlike raw H.264 or FLV. `-avoid_negative_ts make_zero`
+        // anchors the first packet at PTS 0 so the mux side doesn't see
+        // a video stream starting at e.g. 1.4s while dshow audio starts
+        // at 13917s — that mismatch made mux buffer audio and back-pressure
+        // the pipe, throttling capture down from 60 → 27 fps.
+        cap << "-avoid_negative_ts" << "make_zero";
         cap << "-f" << "mpegts" << "pipe:1";
 
         // ----- Mux process -----
@@ -498,6 +503,11 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // we used in the single-process path, and writes to RTMP.
         QStringList& mux = plan.muxArgs;
         mux << "-hide_banner" << "-loglevel" << "info";
+        // `+genpts` regenerates PTS if any packet comes through without
+        // one (paranoia for pipe restarts). `+igndts` keeps mux from
+        // stalling on dts jitter at startup before dshow has begun
+        // producing audio.
+        mux << "-fflags" << "+genpts+igndts";
         mux << "-f" << "mpegts" << "-i" << "pipe:0";
 
         int audioInputCount = 0;
@@ -551,6 +561,12 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
                 << "-ar" << QString::number(cfg.audioSampleRateHz)
                 << "-ac" << "2";
         }
+        // Anchor the first output packet at DTS 0 so Twitch (FLV) doesn't
+        // see giant timestamps from the absolute dshow uptime — without
+        // this, even after asetpts on the filter side, the FLV muxer can
+        // still write negative or huge DTS if aresample emits a packet
+        // before the first video keyframe lands.
+        mux << "-avoid_negative_ts" << "make_zero";
         mux << "-f" << "flv" << rtmpFull;
         return plan;
     }
@@ -600,7 +616,12 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
                 ++counted;
             }
             const QString label = QString("[a%1]").arg(branchIdx++);
-            filter += QString("[%1:a]aresample=async=1,volume=%2")
+            // asetpts=N/SR/TB rewrites the audio PTS from sample count,
+            // wiping out the absolute dshow uptime offset (observed:
+            // start=13917.837s vs video pipe start=1.4s, a 4-hour gap
+            // that made mux freeze trying to sync). aresample=async=1
+            // then nudges samples to align with the video stream.
+            filter += QString("[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=%2")
                           .arg(inputIdx).arg(QString::number(vol, 'f', 3))
                    + label + ";";
             branchLabels << label;
@@ -628,6 +649,9 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
              << "-ar" << QString::number(cfg.audioSampleRateHz)
              << "-ac" << "2";
     }
+    // Symmetric to the two-process path: keep DTS non-negative so FLV
+    // is happy regardless of dshow's absolute uptime timestamps.
+    args << "-avoid_negative_ts" << "make_zero";
     args << "-f" << "flv" << rtmpFull;
     return plan;
 }
