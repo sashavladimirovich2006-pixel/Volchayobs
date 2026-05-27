@@ -438,17 +438,42 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
 
     // ---- Video filter: convert d3d11 frames from ddagrab ----
-    // ddagrab gives us d3d11 hwframes; encoders (incl. NVENC) work fine
-    // with software frames, so we hwdownload to BGRA, scale to target
-    // resolution, and convert to yuv420p on CPU. We tried to keep a
-    // zero-copy GPU pipeline (hwmap=derive_device=cuda + scale_cuda),
-    // but hwmap fails on FFmpeg builds without D3D11VA→CUDA derivation
-    // ("Failed to created derived device context: -40"). The CPU path
-    // costs ~475 MB/s of memcpy at 1080p60 BGRA — negligible on modern
-    // hardware — and NVENC uploads to GPU internally on the way in.
+    // h264_nvenc accepts AV_PIX_FMT_D3D11 directly and converts to its
+    // internal CUDA format inside the NVENC SDK, so when the captured
+    // screen already matches the requested output resolution we can skip
+    // the filter entirely — that's the fastest, lowest-CPU path. If a
+    // resize is required (e.g. 4K screen → 1080p output) we hwdownload
+    // and scale on CPU with bilinear (lanczos at 4K60 was burning a
+    // whole core and dragging fps to ~1).
+    bool encoderSeesD3D11 = false;
 #if defined(Q_OS_WIN)
-    args << "-vf" << QString("hwdownload,format=bgra,scale=%1:%2:flags=lanczos,format=yuv420p")
-                         .arg(cfg.widthPx).arg(cfg.heightPx);
+    {
+        const Source& vsrc = sources[videoIdx];
+        const bool isDisplayCapture = (vsrc.type == SourceType::DisplayCapture);
+        const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
+
+        bool needsScale = true;
+        if (isDisplayCapture) {
+            const auto screens = enumerateScreens();
+            const int sIdx = vsrc.settings.value(SourceFields::SCREEN_INDEX, 0).toInt();
+            if (sIdx >= 0 && sIdx < screens.size()) {
+                const auto& sc = screens[sIdx];
+                needsScale = (sc.w != cfg.widthPx || sc.h != cfg.heightPx);
+            }
+        }
+
+        if (isNvenc && isDisplayCapture && !needsScale) {
+            encoderSeesD3D11 = true;
+        } else if (isDisplayCapture) {
+            if (needsScale) {
+                args << "-vf"
+                     << QString("hwdownload,format=bgra,scale=%1:%2:flags=bilinear,format=yuv420p")
+                            .arg(cfg.widthPx).arg(cfg.heightPx);
+            } else {
+                args << "-vf" << QStringLiteral("hwdownload,format=bgra,format=yuv420p");
+            }
+        }
+    }
 #endif
 
     // ---- Video encoder ----
@@ -458,8 +483,15 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
              << "-profile:v" << cfg.profile
              << "-tune" << "zerolatency";
     }
-    args << "-pix_fmt" << "yuv420p"
-         << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
+    // Skip -pix_fmt when the encoder receives a d3d11 hwframe — emitting
+    // it would force FFmpeg to insert a software format=yuv420p filter
+    // which can't consume hwframes ("Impossible to convert between the
+    // formats supported by ... and 'auto_scale_0'"). NVENC handles the
+    // pixel-format choice itself in that path.
+    if (!encoderSeesD3D11) {
+        args << "-pix_fmt" << "yuv420p";
+    }
+    args << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
          << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
          << "-r" << QString::number(cfg.fps);

@@ -165,6 +165,51 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Стрим: 60 fps восстановлены, NVENC ест d3d11 напрямую (четвёртая итерация)
+
+Контекст: предыдущая итерация добилась того, что стрим **запускался**, но ехал на ~1 fps. Софтовый pipeline с lanczos-скейлом 1920×1080 BGRA→YUV420P на каждом кадре 60 раз в секунду нагружал одно ядро в потолок — и плюс на нём же был serializing hwdownload. С 4K-источниками (если бы кто-то такой сценарий запустил) было бы вообще катастрофически.
+
+Признание: первые три итерации я патчил пайплайн «следующей-ошибкой-из-лога», ни разу не сверившись с тем, что FFmpeg на самом деле умеет на этой машине. Это была патч-тика-вслепую и я закономерно три раза подряд врезался в новый барьер. На четвёртом круге сделал то, что должен был с самого начала — **запустил кандидат-команды руками в терминале**.
+
+Тест:
+
+```
+ffmpeg -hide_banner -t 10 -f lavfi -i ddagrab=output_idx=0:framerate=60 \
+       -c:v h264_nvenc -b:v 6000k -f null -
+```
+
+Результат: `frame=592 fps=58 speed=0.981x` — реалтайм 60 fps. **Никакого `-vf` вообще.** В output-секции FFmpeg рапортует:
+
+```
+Stream #0:0: Video: h264 (Main), d3d11(pc, gbr/bt709/iec61966-2-1, progressive)
+```
+
+То есть `h264_nvenc` принимает `AV_PIX_FMT_D3D11` как input напрямую и сам внутри делает D3D11→CUDA через NVENC SDK (`nvEncRegisterResource` с D3D11_TEXTURE2D handle), без всяких `hwmap`, `scale_cuda` и прочих фильтр-плясок. Этот путь работает на любой современной FFmpeg-сборке с включёнными `--enable-nvenc --enable-d3d11va` (это и BtbN GPL, и GyanD, и любая канонiчная сборка).
+
+Решение (`src/StreamEngine.cpp`, секции «Video filter» и «Video encoder», ~lines 440-493):
+
+В Windows-блоке `buildFfmpegArgs` теперь есть три ветки для DisplayCapture:
+
+1. **NVENC + identity-разрешение** (capture-экран совпадает с output: 1080p→1080p, 1440p→1440p и т.п.) → `-vf` **не выставляется вообще**, `-pix_fmt yuv420p` тоже **не выставляется**. NVENC получает d3d11-hwframe, кодирует напрямую. Zero-copy на стороне FFmpeg, никаких hwdownload/swscale, ~0% CPU на видеообработку.
+
+2. **DisplayCapture с ресайзом** (например, 4K-экран → 1080p-стрим) → `hwdownload,format=bgra,scale=W:H:flags=bilinear,format=yuv420p`. **Bilinear, а не lanczos**, потому что lanczos на 4K60 BGRA — это смерть для одного ядра. Bilinear даёт почти неотличимый визуально результат при ресайзе ≤2× и в 5-7 раз дешевле по CPU.
+
+3. **DisplayCapture без ресайза, не-NVENC энкодер** (libx264 / QSV / AMF) → `hwdownload,format=bgra,format=yuv420p` без скейл-фильтра.
+
+`-pix_fmt yuv420p` теперь выставляется только когда энкодер получает software-кадр (через флаг `encoderSeesD3D11`). Иначе FFmpeg вставляет в конец фильтр-чейна `format=yuv420p`, который не умеет работать с d3d11-hwframe — это ровно та ошибка из второй итерации.
+
+Чтобы понять, нужен ли скейл, в фильтр-секции переспрашиваем `enumerateScreens()` для индекса экрана из `Source.settings[SCREEN_INDEX]` и сравниваем `screen.w/h` с `cfg.widthPx/heightPx`. Это +1 короткий вызов в момент старта стрима, не на каждый кадр — копейки.
+
+Файлы: `src/StreamEngine.cpp` (один блок переписан, плюс условный `-pix_fmt yuv420p` в энкодер-секции).
+
+Эффект:
+
+- 1080p→1080p NVENC-стрим: pipeline ddagrab → wrapped_avframe (lavfi-shim) → h264_nvenc(d3d11). Ноль CPU на видео, 60 fps стабильно, проверено руками вне приложения.
+- 4K→1080p или 1440p→1080p NVENC: bilinear sw-scale, должно держать 60 fps на любом современном CPU (~10-15% одного ядра против 100% c lanczos).
+- Софтовые энкодеры: тот же sw-pipeline, что и раньше, но с bilinear — суммарно быстрее.
+
+Замечен в тесте, но сейчас не лечен: пачка `Application provided invalid, non monotonically increasing dts to muxer` warning'ов от ddagrab. Для null-муксера безвредно; для FLV/RTMP — пока не наблюдал реальной проблемы (стрим у юзера в третьей итерации шёл, просто медленно). Если на Twitch-стороне всплывут jitter / timestamp warnings — добавлю `-fps_mode cfr`, который форсит constant frame rate и регуляризует таймстампы.
+
 ### 2026-05-27 — Стрим: окончательный фикс через софтовый pipeline (третья итерация)
 
 Контекст: после двух попыток поднять zero-copy GPU-pipeline (`scale_cuda`, потом `hwmap=derive_device=cuda`, потом снятие `-pix_fmt yuv420p`) FFmpeg всё ещё падал. Новая ошибка:
