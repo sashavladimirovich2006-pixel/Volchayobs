@@ -165,6 +165,24 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Хотфикс 13.2: -fps_mode это output-опция, переехать к output
+
+Хотфикс 13.1 заменил `-vsync passthrough` на `-fps_mode passthrough`, но **поставил флаг ДО `-i pipe:0`** (на input-стороне). ffmpeg при парсинге аргументов привязывает каждую опцию к ближайшему следующему файлу — и попытался применить `-fps_mode` к input pipe:0:
+
+```
+Option fps_mode (set framerate mode for matching video streams; overrides vsync)
+cannot be applied to input url pipe:0 — you are trying to apply an input
+option to an output file or vice versa. Move this option before the file it belongs to.
+```
+
+Стрим снова не запустился.
+
+**Фикс.** `-fps_mode passthrough` перенесён с input-стороны (между `-fflags` и `-thread_queue_size`) на **output-сторону** (рядом с `-c:v copy`, перед `-avoid_negative_ts make_zero -f flv ...`). Семантически правильное место — это вывод, потому что флаг управляет тем, как ffmpeg пишет видео-PTS на output, а не как читает их с input.
+
+**Тронутые файлы:** `src/StreamEngine.cpp`.
+
+**Урок:** ffmpeg-опции бывают input-specific, output-specific и глобальные. Каждая привязывается к ближайшему следующему `-i ...` или output-URL. Перед сборкой команды программно — мысленно проигрывать порядок: «эта опция относится к input или output?» и ставить её на правильную сторону. Сюда же относятся `-thread_queue_size`, `-rtbufsize`, `-re`, `-itsoffset` — все input. А `-fps_mode`, `-c:v`, `-b:v`, `-avoid_negative_ts`, `-f <output_format>` — все output.
+
 ### 2026-05-28 — Хотфикс 13.1: выкинуть несуществующий mpegts_flag, vsync→fps_mode
 
 13-я итерация вообще не запустилась — capture упал сразу:

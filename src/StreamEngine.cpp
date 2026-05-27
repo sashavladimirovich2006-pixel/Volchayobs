@@ -522,11 +522,6 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // 15700s start delta). `+discardcorrupt` drops any packet that
         // can't be aligned instead of stalling on it.
         mux << "-fflags" << "+genpts+igndts+nobuffer+discardcorrupt";
-        // `-fps_mode passthrough` (was `-vsync passthrough`, deprecated in
-        // recent ffmpeg) tells mux not to rewrite or sync video PTS; since
-        // capture already encoded with stable 60fps, we don't want mux to
-        // think about video timing at all — just copy bytes through.
-        mux << "-fps_mode" << "passthrough";
         // 16384 packets ≈ 4s of video burst headroom. Iter 12 used 4096
         // (~1s) and the stalls persisted, so we're overshooting hard to
         // rule out OS-pipe backpressure entirely.
@@ -586,7 +581,12 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         }
 
         // Video is already encoded — copy it through without re-encoding.
-        mux << "-c:v" << "copy";
+        // `-fps_mode passthrough` (was `-vsync passthrough`) tells the output
+        // not to rewrite or sync video PTS; capture already produced stable
+        // 60fps so mux just copies bytes through. **Output option** — must
+        // sit between inputs and the output URL (iter 13.1 had it before
+        // `-i pipe:0` and ffmpeg refused to start).
+        mux << "-c:v" << "copy" << "-fps_mode" << "passthrough";
         if (audioInputCount > 0) {
             mux << "-c:a" << "aac"
                 << "-b:a" << QString("%1k").arg(cfg.audioBitrateKbps)
