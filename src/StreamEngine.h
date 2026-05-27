@@ -31,6 +31,8 @@ public:
 
     bool isRunning() const;
 
+    void setFfmpegPath(const QString& path); // empty = auto-detect
+
     // Builds the argv that will be passed to ffmpeg. Public so the UI
     // can show a "preview command" and so it can be unit-tested.
     static QStringList buildFfmpegArgs(const StreamConfig& cfg,
@@ -67,6 +69,7 @@ private slots:
 
 private:
     QProcess* m_proc;
+    QString   m_ffmpegPath; // empty = auto-detect via findFfmpeg()
     // Async shutdown ladder: q\n -> terminate -> kill, driven by these
     // single-shot timers so the GUI thread never blocks on waitForFinished.
     QTimer* m_terminateTimer;

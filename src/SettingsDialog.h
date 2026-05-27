@@ -28,6 +28,7 @@ struct Settings {
     QColor        accent   = QColor(255, 153, 0); // amber-orange
     Language      language = Language::English;
     bool          rememberStreamKey = true;
+    QString       ffmpegPath;   // empty = auto-detect
 };
 
 // Modal preferences dialog. Tabs: Stream / Encoder / Appearance.
@@ -64,6 +65,7 @@ private:
     QCheckBox*  m_rememberKey  = nullptr;
 
     // Encoder tab
+    QLineEdit*  m_ffmpegEdit   = nullptr;
     QSpinBox*   m_widthSpin    = nullptr;
     QSpinBox*   m_heightSpin   = nullptr;
     QSpinBox*   m_fpsSpin      = nullptr;

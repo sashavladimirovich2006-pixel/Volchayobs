@@ -522,6 +522,7 @@ void MainWindow::onGoLiveClicked() {
               .arg(m_settings.config.heightPx)
               .arg(m_settings.config.fps)
               .arg(m_settings.config.videoBitrateKbps));
+    m_engine->setFfmpegPath(m_settings.ffmpegPath);
     m_engine->start(m_settings.config, m_settings.target, m_settings.sources);
 }
 

@@ -4,6 +4,7 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -39,6 +40,7 @@ constexpr auto K_PROFILE   = "encoder/profile";
 constexpr auto K_THEME     = "ui/theme";
 constexpr auto K_ACCENT    = "ui/accent";
 constexpr auto K_LANG      = "ui/language";
+constexpr auto K_FFMPEG    = "app/ffmpegPath";
 
 } // namespace
 
@@ -67,6 +69,7 @@ void saveSettings(const Settings& s) {
     q.setValue(K_THEME,    int(s.theme));
     q.setValue(K_ACCENT,   s.accent.name(QColor::HexArgb));
     q.setValue(K_LANG,     languageCode(s.language));
+    q.setValue(K_FFMPEG,   s.ffmpegPath);
 }
 
 Settings loadSettings() {
@@ -95,6 +98,7 @@ Settings loadSettings() {
     s.accent = QColor(q.value(K_ACCENT, s.accent.name(QColor::HexArgb)).toString());
     if (!s.accent.isValid()) s.accent = QColor(255, 153, 0);
     s.language = languageFromCode(q.value(K_LANG, languageCode(s.language)).toString());
+    s.ffmpegPath = q.value(K_FFMPEG).toString();
     return s;
 }
 
@@ -168,6 +172,20 @@ void SettingsDialog::buildStreamTab(QWidget* tab) {
 
 void SettingsDialog::buildEncoderTab(QWidget* tab) {
     auto* form = new QFormLayout(tab);
+
+    m_ffmpegEdit = new QLineEdit;
+    m_ffmpegEdit->setPlaceholderText(tr("Auto-detect (leave empty)"));
+    auto* browseBtn = new QPushButton(tr("Browse…"));
+    browseBtn->setProperty("role", "secondary");
+    connect(browseBtn, &QPushButton::clicked, this, [this] {
+        QString path = QFileDialog::getOpenFileName(this, tr("Select ffmpeg executable"),
+            m_ffmpegEdit->text(), QStringLiteral("ffmpeg (ffmpeg.exe ffmpeg);;All files (*)"));
+        if (!path.isEmpty()) m_ffmpegEdit->setText(path);
+    });
+    auto* ffmpegRow = new QHBoxLayout;
+    ffmpegRow->addWidget(m_ffmpegEdit, 1);
+    ffmpegRow->addWidget(browseBtn);
+    form->addRow(tr("ffmpeg path"), ffmpegRow);
 
     m_widthSpin = new QSpinBox;  m_widthSpin->setRange(320, 3840);  m_widthSpin->setSingleStep(2);
     m_heightSpin = new QSpinBox; m_heightSpin->setRange(240, 2160); m_heightSpin->setSingleStep(2);
@@ -249,6 +267,7 @@ void SettingsDialog::loadFromSettings() {
     m_streamKeyEdit->setText(m_settings.target.streamKey);
     m_rememberKey->setChecked(m_settings.rememberStreamKey);
 
+    m_ffmpegEdit->setText(m_settings.ffmpegPath);
     applyConfigToInputs(m_settings.config);
 
     m_themeCombo->setCurrentIndex(m_themeCombo->findData(int(m_settings.theme)));
@@ -307,6 +326,8 @@ void SettingsDialog::writeBackFromUi() {
     }
     m_settings.target.streamKey = m_streamKeyEdit->text().trimmed();
     m_settings.rememberStreamKey = m_rememberKey->isChecked();
+
+    m_settings.ffmpegPath = m_ffmpegEdit->text().trimmed();
 
     m_settings.config.widthPx = m_widthSpin->value();
     m_settings.config.heightPx = m_heightSpin->value();

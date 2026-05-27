@@ -281,7 +281,6 @@ StreamEngine::StreamEngine(QObject* parent)
       m_proc(new QProcess(this)),
       m_terminateTimer(new QTimer(this)),
       m_killTimer(new QTimer(this)) {
-    m_proc->setProgram(findFfmpeg());
     m_proc->setProcessChannelMode(QProcess::SeparateChannels);
     connect(m_proc, &QProcess::readyReadStandardError,
             this, &StreamEngine::onReadyReadStandardError);
@@ -312,6 +311,10 @@ StreamEngine::~StreamEngine() {
         m_proc->kill();
         m_proc->waitForFinished(2000);
     }
+}
+
+void StreamEngine::setFfmpegPath(const QString& path) {
+    m_ffmpegPath = path;
 }
 
 bool StreamEngine::isRunning() const {
@@ -519,6 +522,7 @@ void StreamEngine::start(const StreamConfig& cfg,
         loggable.last() = QStringLiteral("<rtmp-url-with-stream-key-hidden>");
     }
     emit logLine(QStringLiteral("$ ffmpeg ") + loggable.join(' '));
+    m_proc->setProgram(m_ffmpegPath.isEmpty() ? findFfmpeg() : m_ffmpegPath);
     m_proc->setArguments(args);
     m_swallowProcessErrors = true;
     m_proc->start();
