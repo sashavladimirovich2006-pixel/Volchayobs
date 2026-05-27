@@ -96,13 +96,29 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             const auto screens = enumerateScreens();
 #if defined(Q_OS_WIN)
             QStringList args;
-            // ddagrab uses DXGI Desktop Duplication — much lower CPU/latency than gdigrab.
-            // Falls back to gdigrab if ddagrab is unavailable (older Windows/drivers).
+            // gdigrab is a real demuxer (runs on its own thread with a real
+            // -thread_queue_size buffer), so it's not starved when ffmpeg's
+            // main thread is busy serving dshow audio. ddagrab via -f lavfi
+            // is pull-driven from the main thread and on this user's setup
+            // produced ~6 unique fps once two dshow mics + amix were in the
+            // pipeline (encoder ran at speed=1.06x, so it wasn't the
+            // bottleneck — ddagrab itself simply wasn't being polled at 60Hz).
+            // Trade-off: gdigrab uses ~10-15% CPU at 1080p60 vs ddagrab's
+            // ~0%, no GPU-zero-copy path. Acceptable price for stable fps.
             const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
+            int x = 0, y = 0, w = cfg.widthPx, h = cfg.heightPx;
+            if (screenIdx < screens.size()) {
+                const auto& sc = screens[screenIdx];
+                x = sc.x; y = sc.y; w = sc.w; h = sc.h;
+            }
             args << "-thread_queue_size" << "1024"
-                 << "-f" << "lavfi"
-                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
-                              .arg(screenIdx).arg(fps);
+                 << "-f" << "gdigrab"
+                 << "-framerate" << fps
+                 << "-draw_mouse" << "1"
+                 << "-offset_x" << QString::number(x)
+                 << "-offset_y" << QString::number(y)
+                 << "-video_size" << QString("%1x%2").arg(w).arg(h)
+                 << "-i" << "desktop";
             return args;
 #elif defined(Q_OS_MACOS)
             QStringList args;
@@ -446,20 +462,15 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     args << "-map" << QStringLiteral("0:v");
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
 
-    // ---- Video filter: convert d3d11 frames from ddagrab ----
-    // h264_nvenc accepts AV_PIX_FMT_D3D11 directly and converts to its
-    // internal CUDA format inside the NVENC SDK, so when the captured
-    // screen already matches the requested output resolution we can skip
-    // the filter entirely — that's the fastest, lowest-CPU path. If a
-    // resize is required (e.g. 4K screen → 1080p output) we hwdownload
-    // and scale on CPU with bilinear (lanczos at 4K60 was burning a
-    // whole core and dragging fps to ~1).
+    // ---- Video filter: convert BGRA frames from gdigrab ----
+    // gdigrab outputs software BGRA in CPU memory. Encoders need yuv420p,
+    // so we convert; scale only if the captured screen size differs from
+    // the configured output. Bilinear (not lanczos) keeps CPU cost low.
     bool encoderSeesD3D11 = false;
 #if defined(Q_OS_WIN)
     {
         const Source& vsrc = sources[videoIdx];
         const bool isDisplayCapture = (vsrc.type == SourceType::DisplayCapture);
-        const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
 
         bool needsScale = true;
         if (isDisplayCapture) {
@@ -471,15 +482,13 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
             }
         }
 
-        if (isNvenc && isDisplayCapture && !needsScale) {
-            encoderSeesD3D11 = true;
-        } else if (isDisplayCapture) {
+        if (isDisplayCapture) {
             if (needsScale) {
                 args << "-vf"
-                     << QString("hwdownload,format=bgra,scale=%1:%2:flags=bilinear,format=yuv420p")
+                     << QString("scale=%1:%2:flags=bilinear,format=yuv420p")
                             .arg(cfg.widthPx).arg(cfg.heightPx);
             } else {
-                args << "-vf" << QStringLiteral("hwdownload,format=bgra,format=yuv420p");
+                args << "-vf" << QStringLiteral("format=yuv420p");
             }
         }
     }
