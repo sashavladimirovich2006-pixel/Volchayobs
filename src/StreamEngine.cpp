@@ -96,29 +96,18 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             const auto screens = enumerateScreens();
 #if defined(Q_OS_WIN)
             QStringList args;
-            // gdigrab is a real demuxer (runs on its own thread with a real
-            // -thread_queue_size buffer), so it's not starved when ffmpeg's
-            // main thread is busy serving dshow audio. ddagrab via -f lavfi
-            // is pull-driven from the main thread and on this user's setup
-            // produced ~6 unique fps once two dshow mics + amix were in the
-            // pipeline (encoder ran at speed=1.06x, so it wasn't the
-            // bottleneck — ddagrab itself simply wasn't being polled at 60Hz).
-            // Trade-off: gdigrab uses ~10-15% CPU at 1080p60 vs ddagrab's
-            // ~0%, no GPU-zero-copy path. Acceptable price for stable fps.
+            // ddagrab via -f lavfi: GPU-accelerated DXGI Desktop Duplication.
+            // We tried gdigrab as a "real demuxer with its own thread" hack
+            // to dodge what looked like main-thread starvation from dshow
+            // audio, but gdigrab on this user's box was actually slower
+            // (2 unique fps vs ddagrab's 6) — so the bottleneck is not
+            // pull-vs-push. ddagrab is the lesser evil while we keep
+            // hunting the real cause.
             const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
-            int x = 0, y = 0, w = cfg.widthPx, h = cfg.heightPx;
-            if (screenIdx < screens.size()) {
-                const auto& sc = screens[screenIdx];
-                x = sc.x; y = sc.y; w = sc.w; h = sc.h;
-            }
             args << "-thread_queue_size" << "1024"
-                 << "-f" << "gdigrab"
-                 << "-framerate" << fps
-                 << "-draw_mouse" << "1"
-                 << "-offset_x" << QString::number(x)
-                 << "-offset_y" << QString::number(y)
-                 << "-video_size" << QString("%1x%2").arg(w).arg(h)
-                 << "-i" << "desktop";
+                 << "-f" << "lavfi"
+                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
+                              .arg(screenIdx).arg(fps);
             return args;
 #elif defined(Q_OS_MACOS)
             QStringList args;
@@ -462,15 +451,16 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     args << "-map" << QStringLiteral("0:v");
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
 
-    // ---- Video filter: convert BGRA frames from gdigrab ----
-    // gdigrab outputs software BGRA in CPU memory. Encoders need yuv420p,
-    // so we convert; scale only if the captured screen size differs from
-    // the configured output. Bilinear (not lanczos) keeps CPU cost low.
+    // ---- Video filter: convert d3d11 frames from ddagrab ----
+    // h264_nvenc accepts AV_PIX_FMT_D3D11 directly when capture size
+    // matches output (zero-copy, no -vf). For resize or non-NVENC encoders
+    // we hwdownload to system memory and scale on CPU with bilinear.
     bool encoderSeesD3D11 = false;
 #if defined(Q_OS_WIN)
     {
         const Source& vsrc = sources[videoIdx];
         const bool isDisplayCapture = (vsrc.type == SourceType::DisplayCapture);
+        const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
 
         bool needsScale = true;
         if (isDisplayCapture) {
@@ -482,13 +472,15 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
             }
         }
 
-        if (isDisplayCapture) {
+        if (isNvenc && isDisplayCapture && !needsScale) {
+            encoderSeesD3D11 = true;
+        } else if (isDisplayCapture) {
             if (needsScale) {
                 args << "-vf"
-                     << QString("scale=%1:%2:flags=bilinear,format=yuv420p")
+                     << QString("hwdownload,format=bgra,scale=%1:%2:flags=bilinear,format=yuv420p")
                             .arg(cfg.widthPx).arg(cfg.heightPx);
             } else {
-                args << "-vf" << QStringLiteral("format=yuv420p");
+                args << "-vf" << QStringLiteral("hwdownload,format=bgra,format=yuv420p");
             }
         }
     }
@@ -509,10 +501,15 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     if (!encoderSeesD3D11) {
         args << "-pix_fmt" << "yuv420p";
     }
+    // No explicit -r: with -r enforcing 60 fps CFR, ffmpeg synthesises
+    // duplicate frames whenever the input's PTS gap exceeds 1/60 sec.
+    // Letting the output rate float matches whatever ddagrab actually
+    // delivers (60 fps when healthy, lower if main thread is starved by
+    // audio) — at least Twitch sees honest content instead of a fake
+    // 60 fps stream that's 90 percent duplicates.
     args << "-b:v" << QString("%1k").arg(cfg.videoBitrateKbps)
          << "-g" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
-         << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec)
-         << "-r" << QString::number(cfg.fps);
+         << "-keyint_min" << QString::number(cfg.fps * cfg.keyframeIntervalSec);
 
     const QString rcMode = rateControlMode(cfg.rateControl, cfg.encoder);
     if (cfg.encoder == Encoder::X264) {
