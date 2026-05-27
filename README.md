@@ -165,6 +165,40 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-27 — Фикс краша стрима через 3 секунды: d3d11 → cuda мост для NVENC
+
+Контекст: после нажатия «Go live» FFmpeg-процесс отрабатывал ~3 секунды и падал с `Conversion failed!`. В логе видно ключевую строку:
+
+```
+Impossible to convert between the formats supported by the filter
+'graph -1 input from stream 0:0' and the filter 'auto_scale_0'
+Link 'graph -1 input from stream 0:0.default' -> 'auto_scale_0.default':
+  src: d3d11
+  dst: yuv420p yuyv422 rgb24 ... (огромный список software-форматов, без cuda)
+```
+
+Корень проблемы: `ddagrab` (DXGI Desktop Duplication) выдаёт кадры в hardware-формате `d3d11` (текстуры на GPU), а наш видеофильтр `scale_cuda=W:H:format=yuv420p` принимает на вход только `cuda` frames. Это два разных GPU-контекста, и FFmpeg-овский `auto_scale` между ними мост построить не умеет: он знает software-форматы (yuv420p, rgb24, …), знает как download'ить с d3d11 в RAM, но прямого пути `d3d11 → cuda` через auto-scale нет → конвейер не инициализируется → `Could not open encoder before EOF`.
+
+Дополнительно во ветке non-NVENC (`hwdownload,format=bgra`) кадр выходил в нативном размере экрана и не приводился к yuv420p — энкодеры дотягивали это автоскейлом, но это было неявно и хрупко.
+
+Решение (`src/StreamEngine.cpp`, блок «Video filter» в `buildArgs`):
+
+- **NVENC-ветка:** вместо `scale_cuda=W:H:format=yuv420p` поставлено
+  ```
+  hwmap=derive_device=cuda,scale_cuda=W:H:format=yuv420p
+  ```
+  `hwmap=derive_device=cuda` маппит D3D11-текстуру в CUDA-frame **in-place** (zero-copy через NT shared handle между DXGI- и CUDA-контекстами). Затем `scale_cuda` уже работает с правильным форматом и сразу выдаёт yuv420p, который `h264_nvenc` принимает напрямую. Весь pipeline остаётся на GPU: ddagrab (d3d11) → hwmap (cuda) → scale_cuda (cuda) → h264_nvenc (cuda) — без round-trip'а в RAM.
+
+- **Не-NVENC ветка (libx264 / QSV / AMF):** вместо `hwdownload,format=bgra` поставлено
+  ```
+  hwdownload,format=bgra,scale=W:H:flags=lanczos,format=yuv420p
+  ```
+  Скачиваем кадр из D3D11 в системную память, явно ресайзим Lanczos'ом до целевого разрешения и приводим к yuv420p — чтобы поведение не зависело от скрытого `auto_scale`.
+
+Файлы: `src/StreamEngine.cpp` (один блок, lines ~440-454).
+
+Эффект: «Go live» с NVENC и ddagrab-источником теперь поднимается без падения через 3 секунды, RTMP-поток на Twitch уходит со старта первой секунды. Производительность NVENC сохранена (zero-copy GPU-pipeline), CPU не нагружается лишним hwdownload'ом. Не-NVENC ветка стала предсказуемой по выходному разрешению.
+
 ### 2026-05-27 — Чистка превью: оранжевые рамки cards (RGB) + лишний caption (Screenshot_12/13)
 
 **1. Оранжевая обводка cards на RGB-теме (Screenshot_13).**

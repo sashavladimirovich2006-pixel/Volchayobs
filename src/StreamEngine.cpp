@@ -438,13 +438,17 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
     if (!audioMap.isEmpty()) args << "-map" << audioMap;
 
     // ---- Video filter: convert d3d11 frames from ddagrab ----
+    // ddagrab outputs d3d11; scale_cuda needs cuda, and FFmpeg can't
+    // auto-bridge the two GPU contexts. hwmap=derive_device=cuda maps
+    // the D3D11 texture to a CUDA frame in-place (zero-copy).
 #if defined(Q_OS_WIN)
     const bool isNvenc = (cfg.encoder == Encoder::NVENC_H264);
     if (isNvenc) {
-        args << "-vf" << QString("scale_cuda=%1:%2:format=yuv420p")
+        args << "-vf" << QString("hwmap=derive_device=cuda,scale_cuda=%1:%2:format=yuv420p")
                              .arg(cfg.widthPx).arg(cfg.heightPx);
     } else {
-        args << "-vf" << QStringLiteral("hwdownload,format=bgra");
+        args << "-vf" << QString("hwdownload,format=bgra,scale=%1:%2:flags=lanczos,format=yuv420p")
+                             .arg(cfg.widthPx).arg(cfg.heightPx);
     }
 #endif
 
