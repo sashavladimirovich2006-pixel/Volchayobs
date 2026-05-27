@@ -264,7 +264,13 @@ QStringList audioInputArgsFor(const Source& s) {
     if (id.isEmpty()) return args;
 
 #if defined(Q_OS_WIN)
+    // -rtbufsize 64M lets dshow buffer up to 64MB of audio internally
+    // before producing packets. Default is 3MB, which on this user's
+    // box was too small with two simultaneous USB mics — once the kernel
+    // dshow ring filled, dshow producer threads stalled, and the stall
+    // back-pressured the ffmpeg main loop's video pull.
     args << "-thread_queue_size" << "1024"
+         << "-rtbufsize" << "64M"
          << "-f" << "dshow"
          << "-i" << QString("audio=%1").arg(id);
 #elif defined(Q_OS_MACOS)
@@ -492,6 +498,12 @@ QStringList StreamEngine::buildFfmpegArgs(const StreamConfig& cfg,
         args << "-preset" << cfg.x264Preset
              << "-profile:v" << cfg.profile
              << "-tune" << "zerolatency";
+    } else if (cfg.encoder == Encoder::NVENC_H264) {
+        // -tune ll = low-latency: drops B-frames and look-ahead, which is
+        // both the right choice for live streaming (lower glass-to-glass)
+        // and removes one possible source of pipeline back-pressure
+        // (encoder holding frames waiting on lookahead).
+        args << "-tune" << "ll";
     }
     // Skip -pix_fmt when the encoder receives a d3d11 hwframe — emitting
     // it would force FFmpeg to insert a software format=yuv420p filter
