@@ -101,7 +101,7 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
             const int screenIdx = (idx >= 0 && idx < screens.size()) ? idx : 0;
             args << "-thread_queue_size" << "512"
                  << "-f" << "lavfi"
-                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2")
+                 << "-i" << QString("ddagrab=output_idx=%1:draw_mouse=1:framerate=%2,hwdownload,format=bgra")
                               .arg(screenIdx).arg(fps);
             return args;
 #elif defined(Q_OS_MACOS)
