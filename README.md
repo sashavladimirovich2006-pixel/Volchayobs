@@ -165,6 +165,30 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Хотфикс 13.1: выкинуть несуществующий mpegts_flag, vsync→fps_mode
+
+13-я итерация вообще не запустилась — capture упал сразу:
+
+```
+[MPEGTS muxer] [Eval] Undefined constant or missing '(' in 'nobuffer'
+[MPEGTS muxer] Unable to parse "mpegts_flags" option value "nobuffer"
+[MPEGTS muxer] Error setting option mpegts_flags to value +nobuffer.
+[out#0/mpegts] Could not write header (incorrect codec parameters ?): Invalid argument
+```
+
+`-mpegts_flags +nobuffer` — **не существует**. Я перепутал с `-fflags +nobuffer` (который применяется к demuxer'ам, не к mpegts muxer'у). Реальные значения `mpegts_flags`: `resend_headers`, `latm`, `pat_pmt_at_frames`, `omit_video_pes_length`, `pcr_on_demand`, `initial_discontinuity`, etc — никакого `nobuffer` среди них нет.
+
+Также в логе вылетел warning: `-vsync is deprecated. Use -fps_mode`. Семантика та же, имя сменили.
+
+**Фикс:**
+
+- `-mpegts_flags +nobuffer` убран из capture-аргументов. Остаются `-muxdelay 0 -muxpreload 0 -flush_packets 1` — этого достаточно чтобы убить дефолтные 1.2с буферизации mpegts muxer'а (через `muxdelay`+`muxpreload`) и заставить flush'ить каждый пакет (`flush_packets`).
+- `-vsync passthrough` → `-fps_mode passthrough`. Смысл тот же — не пересчитывать видео-PTS под constant frame rate.
+
+**Тронутые файлы:** `src/StreamEngine.cpp`.
+
+**Урок.** Прежде чем добавлять флаг в production-команду, проверять его существование в актуальной версии ffmpeg (`ffmpeg -h muxer=mpegts`). Не выдумывать «правдоподобные» имена.
+
 ### 2026-05-28 — Тринадцатая итерация: пакет анти-stall флагов на capture и mux
 
 **Контекст и наблюдение.** Двенадцатая итерация дополнила two-process путь правильным `asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=...` для каждого dshow-аудио и подняла `-thread_queue_size 4096` на pipe input mux'а. Юзер протестировал — **паттерн stall'ов не изменился**:

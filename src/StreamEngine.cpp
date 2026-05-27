@@ -494,11 +494,13 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // Real-time MPEG-TS over a pipe needs muxer tuning. Default
         // -muxdelay (0.7s) and -muxpreload (0.5s) buffer ~1.2s of video
         // at the mpegts muxer before it'll flush, which on a 60fps stream
-        // means bursts of ~70 frames suddenly hit the pipe at once. -mpegts_flags
-        // +nobuffer + -flush_packets 1 force every packet straight out.
+        // means bursts of ~70 frames suddenly hit the pipe at once.
+        // -flush_packets 1 forces every packet straight out.
+        // NB: iter 13 also tried -mpegts_flags +nobuffer but that value
+        // doesn't exist on this mpegts muxer ("Undefined constant ... in
+        // 'nobuffer'") and broke capture entirely. Removed.
         cap << "-muxdelay" << "0"
             << "-muxpreload" << "0"
-            << "-mpegts_flags" << "+nobuffer"
             << "-flush_packets" << "1";
         // `-avoid_negative_ts make_zero` anchors the first packet at PTS 0
         // so the mux side doesn't see a video stream starting at 1.4s
@@ -520,10 +522,11 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         // 15700s start delta). `+discardcorrupt` drops any packet that
         // can't be aligned instead of stalling on it.
         mux << "-fflags" << "+genpts+igndts+nobuffer+discardcorrupt";
-        // `-vsync passthrough` tells mux not to rewrite or sync video PTS;
-        // since capture already encoded with stable 60fps, we don't want
-        // mux to think about video timing at all — just copy bytes.
-        mux << "-vsync" << "passthrough";
+        // `-fps_mode passthrough` (was `-vsync passthrough`, deprecated in
+        // recent ffmpeg) tells mux not to rewrite or sync video PTS; since
+        // capture already encoded with stable 60fps, we don't want mux to
+        // think about video timing at all — just copy bytes through.
+        mux << "-fps_mode" << "passthrough";
         // 16384 packets ≈ 4s of video burst headroom. Iter 12 used 4096
         // (~1s) and the stalls persisted, so we're overshooting hard to
         // rule out OS-pipe backpressure entirely.
