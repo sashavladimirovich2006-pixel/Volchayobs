@@ -2,6 +2,7 @@
 
 #include "Devices.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -11,6 +12,37 @@
 namespace lumen {
 
 namespace {
+
+QString findFfmpeg() {
+    // 1. Already on PATH
+    QString found = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    if (!found.isEmpty()) return found;
+
+    // 2. Next to our own executable
+    QString appDir = QCoreApplication::applicationDirPath();
+    for (const QString& rel : {QStringLiteral("ffmpeg.exe"), QStringLiteral("ffmpeg/bin/ffmpeg.exe")}) {
+        QString candidate = appDir + '/' + rel;
+        if (QFileInfo::exists(candidate)) return candidate;
+    }
+
+    // 3. Common Windows install locations
+    const QStringList roots = {
+        qEnvironmentVariable("ProgramFiles"),
+        qEnvironmentVariable("ProgramFiles(x86)"),
+        qEnvironmentVariable("LOCALAPPDATA"),
+        QStringLiteral("C:/ffmpeg"),
+        QStringLiteral("C:/tools/ffmpeg"),
+    };
+    for (const QString& root : roots) {
+        if (root.isEmpty()) continue;
+        for (const QString& rel : {QStringLiteral("ffmpeg/bin/ffmpeg.exe"), QStringLiteral("bin/ffmpeg.exe"), QStringLiteral("ffmpeg.exe")}) {
+            QString candidate = root + '/' + rel;
+            if (QFileInfo::exists(candidate)) return candidate;
+        }
+    }
+
+    return QStringLiteral("ffmpeg"); // fallback — will fail with a clear error
+}
 
 QString encoderName(Encoder e) {
     switch (e) {
@@ -249,7 +281,7 @@ StreamEngine::StreamEngine(QObject* parent)
       m_proc(new QProcess(this)),
       m_terminateTimer(new QTimer(this)),
       m_killTimer(new QTimer(this)) {
-    m_proc->setProgram(QStringLiteral("ffmpeg"));
+    m_proc->setProgram(findFfmpeg());
     m_proc->setProcessChannelMode(QProcess::SeparateChannels);
     connect(m_proc, &QProcess::readyReadStandardError,
             this, &StreamEngine::onReadyReadStandardError);

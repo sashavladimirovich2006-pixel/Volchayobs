@@ -507,13 +507,6 @@ void MainWindow::refreshStreamSummary() {
     m_presetLabel->setText(presetName);
     m_bitrateLabel->setText(
         QString("%1 kbps").arg(m_settings.config.videoBitrateKbps));
-    if (m_preview) {
-        m_preview->setSummary(QString("%1×%2 @ %3 fps · %4 kbps")
-            .arg(m_settings.config.widthPx)
-            .arg(m_settings.config.heightPx)
-            .arg(m_settings.config.fps)
-            .arg(m_settings.config.videoBitrateKbps));
-    }
 }
 
 void MainWindow::onGoLiveClicked() {
