@@ -8,6 +8,7 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QStringBuilder>
+#include <QThread>
 
 namespace lumen {
 
@@ -258,27 +259,52 @@ QStringList videoInputArgsFor(const Source& s, const StreamConfig& cfg,
     return {};
 }
 
-QStringList audioInputArgsFor(const Source& s) {
+// Build ffmpeg `-i ...` flags for one audio source.
+//
+// On Windows this returns the WASAPI named-pipe input form
+//     -f f32le -ar 0 -ac 0 -i \\.\pipe\volchay-audio-<n>-<pid>
+// where the `-ar`/`-ac` values are placeholders that StreamEngine::start
+// replaces with the real mix format once the WasapiLoopback worker has
+// published it. The `audio=...` device id stored on the Source is
+// ignored on Windows — we always go through the default render
+// (DesktopAudio) or default capture (Microphone) endpoint, which is the
+// same convention AudioLevelProbe uses for metering.
+//
+// On non-Windows we keep the old dshow / pulse / avfoundation device
+// path — those backends timestamp packets sensibly and never produced
+// the uptime-offset issue dshow did on Windows.
+QStringList audioInputArgsFor(const Source& s, int sourceIndex) {
     QStringList args;
-    const QString id = s.settings.value(SourceFields::AUDIO_DEVICE_ID).toString();
-    if (id.isEmpty()) return args;
 
 #if defined(Q_OS_WIN)
-    // -rtbufsize 64M lets dshow buffer up to 64MB of audio internally
-    // before producing packets. Default is 3MB, which on this user's
-    // box was too small with two simultaneous USB mics — once the kernel
-    // dshow ring filled, dshow producer threads stalled, and the stall
-    // back-pressured the ffmpeg main loop's video pull.
-    args << "-thread_queue_size" << "1024"
-         << "-rtbufsize" << "64M"
-         << "-f" << "dshow"
-         << "-i" << QString("audio=%1").arg(id);
-#elif defined(Q_OS_MACOS)
-    args << "-f" << "avfoundation" << "-i" << QString(":%1").arg(id);
-#else
-    args << "-f" << "pulse" << "-i" << id;
-#endif
+    Q_UNUSED(s);
+    // The pipe name is unique per (process, source) to survive a quick
+    // stop/start (the previous server handle may still be lingering in
+    // the kernel for a few ms after CloseHandle).
+    const QString pipeName = QString(R"(\\.\pipe\volchay-audio-%1-%2)")
+                                  .arg(sourceIndex)
+                                  .arg(qApp ? qApp->applicationPid() : 0);
+    // -ar / -ac get filled in by StreamEngine::start once the WASAPI
+    // worker has reported the endpoint's actual mix format. We still
+    // emit them here as placeholders so the surrounding code paths that
+    // count args / hide the rtmp url don't get surprised by an asymmetric
+    // shape.
+    args << "-f" << "f32le"
+         << "-ar" << "0"
+         << "-ac" << "0"
+         << "-i"  << pipeName;
     return args;
+#else
+    const QString id = s.settings.value(SourceFields::AUDIO_DEVICE_ID).toString();
+    if (id.isEmpty()) return args;
+#  if defined(Q_OS_MACOS)
+    args << "-f" << "avfoundation" << "-i" << QString(":%1").arg(id);
+#  else
+    args << "-f" << "pulse" << "-i" << id;
+#  endif
+    Q_UNUSED(sourceIndex);
+    return args;
+#endif
 }
 
 } // namespace
@@ -334,6 +360,10 @@ StreamEngine::~StreamEngine() {
             p->waitForFinished(2000);
         }
     }
+    // unique_ptr destructors call WasapiLoopback::stop(), which joins
+    // each worker thread; do this AFTER the ffmpeg processes are dead
+    // so they don't briefly read from an already-closed pipe.
+    m_audioCaptures.clear();
 }
 
 void StreamEngine::setFfmpegPath(const QString& path) {
@@ -390,7 +420,15 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         (sources[videoIdx].type == SourceType::DisplayCapture);
     bool useTwoProcess = false;
 #if defined(Q_OS_WIN)
-    useTwoProcess = isDisplayCapture && !audioInputs.isEmpty();
+    // Two-process is needed for ANY Windows audio session, not just
+    // DisplayCapture. Reasons:
+    //   - DisplayCapture+audio: ddagrab pull starvation by audio demux
+    //     (the original reason; see iter 10 in README).
+    //   - WindowCapture+audio / VideoCapture+audio: the new WASAPI
+    //     named-pipe scheme needs the mux ffmpeg to be a separate
+    //     client process so the pipe handshake lines up. The pipes are
+    //     populated in plan.audioPipes only in this branch.
+    useTwoProcess = !audioInputs.isEmpty();
 #endif
 
     // ---- Volume helper (shared) ----
@@ -497,16 +535,20 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         cap << "-muxdelay" << "0"
             << "-muxpreload" << "0";
         // `-avoid_negative_ts make_zero` anchors the first packet at PTS 0
-        // so the mux side doesn't see a video stream starting at 1.4s
-        // while dshow audio starts at 15730s — that mismatch made mux
-        // buffer audio and back-pressure the pipe.
+        // so the mux side sees a clean zero-based video timeline. Kept
+        // from the dshow era (where it also masked the audio-side uptime
+        // offset); harmless either way and useful as a belt-and-braces.
         cap << "-avoid_negative_ts" << "make_zero";
         cap << "-f" << "mpegts" << "pipe:1";
 
         // ----- Mux process -----
-        // Reads encoded video from stdin (input 0), then dshow audio
-        // (inputs 1, 2, ...), mixes audio with the same filter graph
-        // we used in the single-process path, and writes to RTMP.
+        // Reads encoded video from stdin (input 0), then one WASAPI
+        // named pipe per enabled audio source (inputs 1, 2, ...). Each
+        // pipe carries raw f32le PCM from a WasapiLoopback worker —
+        // no dshow, no uptime-offset, no demuxer-level sync stalls.
+        // The actual -ar/-ac values are placeholders here; StreamEngine
+        // ::start patches them with each worker's published mix format
+        // after the pipe is up.
         QStringList& mux = plan.muxArgs;
         mux << "-hide_banner" << "-loglevel" << "info";
         // `+genpts` regenerates PTS if any packet comes through without
@@ -525,12 +567,29 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
 
         int audioInputCount = 0;
         constexpr int firstAudioInputIndex = 1; // video is input 0 (pipe)
+        // Per-input volume, captured in plan order so start() can also
+        // see it (used by the volume= filter further down).
+        QList<double> perInputVolume;
         for (int i : audioInputs) {
-            const QStringList a = audioInputArgsFor(sources[i]);
-            if (!a.isEmpty()) {
-                mux << a;
-                ++audioInputCount;
-            }
+            const QStringList a = audioInputArgsFor(sources[i], i);
+            if (a.isEmpty()) continue;
+            mux << a;
+            ++audioInputCount;
+            perInputVolume << volumeFor(sources[i]);
+#if defined(Q_OS_WIN)
+            AudioCapturePlan acp;
+            acp.sourceIndex = i;
+            // The pipe name in `a` is the last value before this -i
+            // pair; reconstructing it would be brittle, so just rebuild
+            // it the same way audioInputArgsFor did. Keep this format
+            // string in sync with audioInputArgsFor() above.
+            acp.pipeName = QString(R"(\\.\pipe\volchay-audio-%1-%2)")
+                                 .arg(i)
+                                 .arg(qApp ? qApp->applicationPid() : 0);
+            acp.loopback = (sources[i].type == SourceType::DesktopAudio);
+            acp.volume   = perInputVolume.last();
+            plan.audioPipes.push_back(acp);
+#endif
         }
         if (audioInputCount > 0) {
             QString filter;
@@ -538,24 +597,15 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
             int branchIdx = 0;
             for (int j = 0; j < audioInputCount; ++j) {
                 const int inputIdx = firstAudioInputIndex + j;
-                double vol = 1.0;
-                int counted = 0;
-                for (int i : audioInputs) {
-                    if (audioInputArgsFor(sources[i]).isEmpty()) continue;
-                    if (counted == j) { vol = volumeFor(sources[i]); break; }
-                    ++counted;
-                }
+                const double vol = (j < perInputVolume.size())
+                                       ? perInputVolume[j] : 1.0;
                 const QString label = QString("[a%1]").arg(branchIdx++);
-                // asetpts=N/SR/TB rewrites the audio PTS from sample count,
-                // wiping out the absolute dshow uptime offset (observed:
-                // start=14970s vs video pipe start=0s, a 4-hour gap that
-                // froze mux trying to sync). aresample=async=1:first_pts=0
-                // then locks the first output sample to PTS=0.
-                // NB: 11-я итерация добавила asetpts только в single-process
-                // ветке — Edit с replace_all пропустил это вхождение, и
-                // two-process путь продолжал заикаться. Двенадцатая —
-                // именно это и чинит.
-                filter += QString("[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=%2")
+                // No more asetpts/aresample acrobatics: WASAPI pipes are
+                // already zero-based and at a fixed sample rate. Keeping
+                // only `volume=` per branch + amix downstream means the
+                // filter graph stays minimal and predictable. The 11-14
+                // iter offset-normalization costume is no longer needed.
+                filter += QString("[%1:a]volume=%2")
                               .arg(inputIdx).arg(QString::number(vol, 'f', 3))
                        + label + ";";
                 branchLabels << label;
@@ -599,24 +649,30 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
     }
 
     // ===== Branch B: single-process pipeline =====
+    // Reached for: non-Windows (mac/linux) OR Windows-without-audio OR
+    // non-DisplayCapture video. On Windows this branch never has audio
+    // (audioInputs would have forced useTwoProcess true), so the WASAPI
+    // named-pipe path doesn't kick in here.
     QStringList& args = plan.muxArgs;
     args << "-hide_banner" << "-loglevel" << "info";
     args << videoArgs;
 
     int audioInputCount = 0;
     constexpr int firstAudioInputIndex = 1; // video is input 0
+    QList<double> perInputVolume;
     for (int i : audioInputs) {
-        const QStringList a = audioInputArgsFor(sources[i]);
-        if (!a.isEmpty()) {
-            args << a;
-            ++audioInputCount;
-        }
+        const QStringList a = audioInputArgsFor(sources[i], i);
+        if (a.isEmpty()) continue;
+        args << a;
+        ++audioInputCount;
+        perInputVolume << volumeFor(sources[i]);
     }
     if (audioInputCount == 0 && sources[videoIdx].type == SourceType::TestPattern) {
         args << "-f" << "lavfi"
              << "-i" << QString("sine=frequency=440:sample_rate=%1")
                             .arg(cfg.audioSampleRateHz);
         ++audioInputCount;
+        perInputVolume << 1.0;
     }
 
     QString audioMap;
@@ -635,20 +691,12 @@ StreamEngine::FfmpegPlan StreamEngine::buildFfmpegPlan(
         }
         for (int j = 0; j < audioInputCount; ++j) {
             const int inputIdx = firstAudioInputIndex + j;
-            double vol = 1.0;
-            int counted = 0;
-            for (int i : audioInputs) {
-                if (audioInputArgsFor(sources[i]).isEmpty()) continue;
-                if (counted == j) { vol = volumeFor(sources[i]); break; }
-                ++counted;
-            }
+            const double vol = (j < perInputVolume.size()) ? perInputVolume[j] : 1.0;
             const QString label = QString("[a%1]").arg(branchIdx++);
-            // asetpts=N/SR/TB rewrites the audio PTS from sample count,
-            // wiping out the absolute dshow uptime offset (observed:
-            // start=13917.837s vs video pipe start=1.4s, a 4-hour gap
-            // that made mux freeze trying to sync). aresample=async=1
-            // then nudges samples to align with the video stream.
-            filter += QString("[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=%2")
+            // Minimal filter: just per-branch volume. Pulse/avfoundation
+            // and the lavfi sine source all hand us sane timestamps, so
+            // none of the asetpts/aresample workarounds belong here.
+            filter += QString("[%1:a]volume=%2")
                           .arg(inputIdx).arg(QString::number(vol, 'f', 3))
                    + label + ";";
             branchLabels << label;
@@ -696,7 +744,7 @@ void StreamEngine::start(const StreamConfig& cfg,
     }
 
     QString reason;
-    const FfmpegPlan plan = buildFfmpegPlan(cfg, target, sources, &reason);
+    FfmpegPlan plan = buildFfmpegPlan(cfg, target, sources, &reason);
     if (plan.muxArgs.isEmpty()) {
         emit errorOccurred(reason.isEmpty()
             ? tr("Video source is not configured.") : reason);
@@ -709,6 +757,58 @@ void StreamEngine::start(const StreamConfig& cfg,
         }
         emit logLine(prefix + a.join(' '));
     };
+
+    // Bring up one WasapiLoopback per audio pipe BEFORE launching the
+    // mux ffmpeg. Each worker creates its named-pipe server and blocks
+    // on ConnectNamedPipe; the ffmpeg client opening the same pipe is
+    // what unblocks it. Once a worker reports its mix format, we patch
+    // the placeholder `-ar 0 -ac 0` we left in muxArgs with the real
+    // values, so ffmpeg parses the f32le stream correctly.
+    m_audioCaptures.clear();
+#if defined(Q_OS_WIN)
+    for (const AudioCapturePlan& acp : plan.audioPipes) {
+        auto worker = std::make_unique<WasapiLoopback>();
+        if (!worker->startCapture(acp.pipeName, acp.loopback)) {
+            emit errorOccurred(
+                tr("Failed to start WASAPI capture for source #%1.")
+                    .arg(acp.sourceIndex));
+            m_audioCaptures.clear();
+            return;
+        }
+        // The mix format is published from inside the worker thread.
+        // GetMixFormat happens within the first few milliseconds — poll
+        // briefly so we don't race the worker on a cold start.
+        int sr = 0, ch = 0;
+        for (int waitMs = 0; waitMs < 1500; waitMs += 20) {
+            sr = worker->sampleRate();
+            ch = worker->channels();
+            if (sr > 0 && ch > 0) break;
+            QThread::msleep(20);
+        }
+        if (sr <= 0 || ch <= 0) {
+            emit errorOccurred(
+                tr("WASAPI worker did not publish a mix format for source #%1.")
+                    .arg(acp.sourceIndex));
+            m_audioCaptures.clear();
+            return;
+        }
+        // Patch the matching placeholder in plan.muxArgs. The audio
+        // input was emitted by audioInputArgsFor() as
+        //     [iPos-7]=-f  [iPos-6]=f32le
+        //     [iPos-5]=-ar [iPos-4]=0
+        //     [iPos-3]=-ac [iPos-2]=0
+        //     [iPos-1]=-i  [iPos]=<pipeName>
+        // so we overwrite the two zero placeholders.
+        const int iPos = plan.muxArgs.indexOf(acp.pipeName);
+        if (iPos >= 7 && plan.muxArgs.value(iPos - 1) == QStringLiteral("-i")
+                     && plan.muxArgs.value(iPos - 5) == QStringLiteral("-ar")
+                     && plan.muxArgs.value(iPos - 3) == QStringLiteral("-ac")) {
+            plan.muxArgs[iPos - 4] = QString::number(sr);
+            plan.muxArgs[iPos - 2] = QString::number(ch);
+        }
+        m_audioCaptures.push_back(std::move(worker));
+    }
+#endif
 
     const QString ffmpegExe =
         m_ffmpegPath.isEmpty() ? findFfmpeg() : m_ffmpegPath;
@@ -733,6 +833,10 @@ void StreamEngine::start(const StreamConfig& cfg,
         if (!okCap || !okMux) {
             if (m_captureProc->state() == QProcess::Running) m_captureProc->kill();
             if (m_muxProc->state() == QProcess::Running) m_muxProc->kill();
+            // Workers are blocked in WriteFile on the now-orphaned pipe;
+            // stop() makes their thread exit cleanly via stopFlag and
+            // closes the pipe handle.
+            m_audioCaptures.clear();
             emit errorOccurred(tr("Failed to launch ffmpeg. Make sure ffmpeg is installed and on PATH."));
             return;
         }
@@ -745,6 +849,7 @@ void StreamEngine::start(const StreamConfig& cfg,
         const bool ok = m_muxProc->waitForStarted(3000);
         m_swallowProcessErrors = false;
         if (!ok) {
+            m_audioCaptures.clear();
             emit errorOccurred(tr("Failed to launch ffmpeg. Make sure ffmpeg is installed and on PATH."));
             return;
         }
@@ -842,6 +947,12 @@ void StreamEngine::onMuxFinished(int exitCode, QProcess::ExitStatus status) {
     }
     m_terminateTimer->stop();
     m_killTimer->stop();
+    // ffmpeg has closed the read end of every audio pipe — workers are
+    // now writing into a broken pipe and would mark themselves
+    // pipeAlive=false on their next chunk. Tear them down explicitly so
+    // their threads exit promptly and the pipe handles are released
+    // before the next start().
+    m_audioCaptures.clear();
     emit stopped(exitCode, status);
 }
 

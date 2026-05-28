@@ -2,11 +2,15 @@
 
 #include "PresetManager.h"
 #include "Source.h"
+#include "WasapiLoopback.h"
 
 #include <QObject>
 #include <QProcess>
 #include <QString>
 #include <QTimer>
+
+#include <memory>
+#include <vector>
 
 namespace lumen {
 
@@ -24,13 +28,25 @@ struct StreamTarget {
 //             |
 //             | (Qt-managed pipe)
 //             v
-//     [mux ffmpeg]   mpegts on stdin + dshow audio → flv → RTMP
+//     [mux ffmpeg]   mpegts on stdin + WASAPI named pipes (raw f32le) → flv → RTMP
 //
 // Single-process ffmpeg with ddagrab + dshow audio + amix stalls the
 // lavfi pull thread (audio demuxing dominates the main loop, ddagrab
 // gets polled at ~6Hz instead of 60). Splitting into two processes
 // gives the capture loop sole ownership of the video pull -- proven
 // in user testing to recover full 60fps. See the README dev log.
+//
+// Audio sources do NOT go through ffmpeg-dshow anymore. dshow capture
+// devices stamp packets with the device's *uptime* (5-hour absolute
+// offset on a long-running box), which froze the mux trying to sync
+// audio against a zero-based video pipe — that was the root cause of
+// 14 iterations of stream stalls. Instead, each enabled microphone /
+// desktop-audio source spins up its own WasapiLoopback worker that
+// captures the endpoint's mix format (f32le 48k stereo by default) and
+// pumps the raw samples into a Windows named pipe; the mux ffmpeg reads
+// each pipe with `-f f32le -ar <sr> -ac <ch>`. WASAPI hands us
+// near-zero-based timestamps, so the offset (and the stalls it caused)
+// simply don't exist on this path.
 //
 // For sources without audio (or non-Windows), we keep the simpler
 // single-process path. m_muxProc is null in that case.
@@ -48,10 +64,28 @@ public:
     // implement a stream session. captureArgs is empty when the session
     // can be served by a single ffmpeg invocation (no audio, or non-
     // Windows where dshow contention isn't a concern).
-    struct FfmpegPlan {
-        QStringList captureArgs;  // process A: video capture + encode → pipe
-        QStringList muxArgs;      // process B (or single): audio + mux → RTMP
+    //
+    // On Windows, audio sources are pumped through Windows named pipes
+    // by WasapiLoopback workers — one per source. AudioCapturePlan
+    // describes a single such pipe so start() can spin up the matching
+    // WasapiLoopback before the ffmpeg client tries to connect.
+    struct AudioCapturePlan {
+        int     sourceIndex = -1;        // index into the SourceList we built from
+        QString pipeName;                // full Win32 form, e.g. \\.\pipe\volchay-...
+        bool    loopback = true;         // true: render+LOOPBACK (desktop); false: mic
+        double  volume   = 1.0;          // applied via `volume=` filter on mux
     };
+    struct FfmpegPlan {
+        QStringList                captureArgs;   // process A: video capture + encode → pipe
+        QStringList                muxArgs;       // process B (or single): audio + mux → RTMP
+        std::vector<AudioCapturePlan> audioPipes; // Windows-only WASAPI sources, in input order
+    };
+    // The plan is built in two phases: first sizes and decides which
+    // audio sources will be WASAPI-pumped, then the engine calls back
+    // with the actual sampleRate/channels each WasapiLoopback published
+    // so the right `-ar`/`-ac` flags land in muxArgs. For tests and
+    // pure non-Windows paths the static helper still works as before
+    // (audioPipes will be empty).
     static FfmpegPlan buildFfmpegPlan(const StreamConfig& cfg,
                                       const StreamTarget& target,
                                       const SourceList& sources,
@@ -96,6 +130,11 @@ private:
     QProcess* m_muxProc;
     QProcess* m_captureProc;
     QString   m_ffmpegPath; // empty = auto-detect via findFfmpeg()
+    // WASAPI audio pumps — one per enabled mic/desktop source on Windows.
+    // Each owns a named pipe whose path is what mux ffmpeg connects to
+    // as a `-f f32le -i ...` input. Reset on every start()/stop() so the
+    // mux ffmpeg and the pump start and stop together.
+    std::vector<std::unique_ptr<WasapiLoopback>> m_audioCaptures;
     // Async shutdown ladder: q\n → terminate → kill, driven by these
     // single-shot timers so the GUI thread never blocks on waitForFinished.
     QTimer* m_terminateTimer;

@@ -165,6 +165,47 @@ resources/
 
 Здесь фиксируется каждый шаг — что, зачем и какие файлы.
 
+### 2026-05-28 — Пятнадцатая итерация: корень найден, аудио переехало с dshow на WASAPI named pipe
+
+**Контекст / диагноз.** После 14 итераций безуспешных попыток побороть 8-секундный stall pattern наблюдение пользователя вскрыло корень: «звук рабочего стола» в выборе называется `Microphone (VXE V1)` — значит desktop-аудио берётся как **dshow capture-устройство** (микрофонный вход), а не loopback с render-устройства. А dshow capture-устройства на Windows используют **uptime устройства как базу таймстампов** — отсюда тот самый offset в ~16979 секунд, который мы 14 итераций безуспешно давили через `asetpts` / `aresample`.
+
+PTS-нормализация работает уже ПОСЛЕ demuxer-level sync, поэтому mux всё равно буферизовал аудио, ждал «синхронизированного» keyframe и через pipe back-pressure тормозил ddagrab pull. Stalls с цикличностью ~110 кадров — это были ровно паузы mux'а, пока он ждал, что аудио «догонит» (а оно никогда не догоняло, потому что offset постоянный).
+
+**Решение.** Убрать ffmpeg-dshow из аудио-тракта полностью. Захватывать аудио нативно через WASAPI и подавать сырой PCM в mux-ffmpeg через **Windows named pipe**. WASAPI отдаёт near-zero-based таймстампы, demuxer-sync становится тривиальным. Это путь, которым идёт OBS.
+
+**Применённые правки:**
+
+1. **`WasapiLoopback` — режим PCM-pump (src/WasapiLoopback.h, src/WasapiLoopback.cpp).**
+   - Класс раньше умел только мерять peak dBFS для индикатора. Теперь у него два режима: старый `start()` (метеринг) и новый `startCapture(pipeName, loopback)`, который дополнительно пишет сырой PCM (mix format, обычно f32le 48k stereo) в Windows named pipe.
+   - Worker thread параметризован структурой `CaptureParams { loopback, writePcm, pipe, outSampleRate, outChannels }`. Endpoint выбирается через `EDataFlow`: `eRender` + `AUDCLNT_STREAMFLAGS_LOOPBACK` для desktop audio, `eCapture` без LOOPBACK для микрофона.
+   - Pipe создаётся в `startCapture` **до** старта потока (`CreateNamedPipeW` с `PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED`, 256KB буфер). Worker блокируется на `ConnectNamedPipe` (overlapped + событие) с 100ms-слайсами проверки stopFlag — пользователь может прервать запуск, даже если ffmpeg-клиент не подключился.
+   - Все `WriteFile` в pull loop тоже overlapped (с 1s WaitForSingleObject) — обязательно для handle с `FILE_FLAG_OVERLAPPED`. На `AUDCLNT_BUFFERFLAGS_SILENT` пишем тишину, чтобы PCM-таймлайн оставался непрерывным.
+   - Worker публикует `sampleRate`/`channels` из `GetMixFormat` в `std::atomic<int>*`, чтобы StreamEngine увидел реальный формат и подставил его в `-ar`/`-ac` ffmpeg.
+
+2. **`StreamEngine` — потребление named pipe вместо dshow (src/StreamEngine.h, src/StreamEngine.cpp).**
+   - `audioInputArgsFor` на Windows теперь возвращает не `-f dshow -i audio=<name>`, а плейсхолдер `-f f32le -ar 0 -ac 0 -i \\.\pipe\volchay-audio-<idx>-<pid>`. Реальные `-ar`/`-ac` подставит `start()` после того, как WASAPI-воркер опубликует mix format.
+   - `FfmpegPlan` расширен полем `std::vector<AudioCapturePlan>` с описанием каждого pipe (sourceIndex, pipeName, loopback, volume) — заполняется в Branch A.
+   - `StreamEngine::start()`: для каждого `AudioCapturePlan` создаёт `WasapiLoopback`, поднимает named-pipe сервер, опрашивает sampleRate/channels (poll-цикл 1.5с с шагом 20мс), патчит плейсхолдеры в `plan.muxArgs` (`iPos-4` → SR, `iPos-2` → ch), и только потом запускает ffmpeg-клиенты (capture + mux). При любой ошибке — workers очищаются.
+   - `~StreamEngine` и `onMuxFinished` очищают `m_audioCaptures` после того, как ffmpeg уже мёртв — порядок: q→terminate→kill ffmpeg, потом stop WASAPI-потоков.
+   - **`useTwoProcess` расширен**: теперь на Windows ЛЮБОЙ источник с аудио форсирует two-process путь (не только DisplayCapture). Иначе плейсхолдеры аудио оказались бы в Branch B, где `AudioCapturePlan` не создаётся и WASAPI-воркер не поднимается.
+   - **filter_complex упрощён**: `[%1:a]asetpts=N/SR/TB,aresample=async=1:first_pts=0,volume=...` → `[%1:a]volume=...`. WASAPI pipe уже zero-based и фиксированной частоты, костыли 11-14 итераций больше не нужны. Это лучшая часть отката — мы выкинули три слоя обходов корневой проблемы.
+
+3. **Откачено / выпилено:**
+   - `-rtbufsize 64M` (был против dshow ring buffer starvation) — больше нет dshow.
+   - `-thread_queue_size 1024` на dshow input — нет dshow input.
+   - `asetpts=N/SR/TB` и `aresample=async=1:first_pts=0` — больше не нужны.
+   - Branch B (single-process) тоже потерял `asetpts/aresample` — на non-Windows pulse/avfoundation timestamps и так нормальные, костыли там тоже не нужны.
+
+**Тронутые файлы:** `src/WasapiLoopback.h`, `src/WasapiLoopback.cpp`, `src/StreamEngine.h`, `src/StreamEngine.cpp`, `README.md`.
+
+**Ограничения / следующие шаги:**
+- WASAPI на этой итерации использует **default render** (для DesktopAudio) и **default capture** (для Microphone) endpoint, игнорируя сохранённый dshow friendly-name. Если у юзера выбран не-default endpoint, он сейчас не выберется. Точный маппинг friendly-name → MMDevice ID — отдельная итерация (потребует `IMMDeviceEnumerator::EnumAudioEndpoints` и совпадение по `PKEY_Device_FriendlyName`).
+- `enumerateDesktopAudio()` в Devices.cpp всё ещё показывает dshow-микрофоны в списке Desktop Audio (`qtOthers` fallback). Это не блокирует исправление (мы всё равно идём через default render), но UI можно почистить — отдельной итерацией.
+
+**Что юзеру попробовать СЕЙЧАС:**
+
+> Собрать CI-артефакт (Windows-only build), запустить стрим с одним DisplayCapture + одним Desktop Audio источником. Ожидание: mux держит ~60fps без 8-секундных пауз, `time=` растёт равномерно, `speed≈1.0x`. В логе НЕ должно быть гигантских `start=14970s` оффсетов у аудио-входа — там должен быть свежий f32le PCM с нуля.
+
 ### 2026-05-28 — Четырнадцатая итерация: откат регрессий 13.x, диагностический тупик
 
 **Контекст.** Хотфикс 13.2 запустил стрим (флаги наконец-то валидные), но **стало хуже чем в 12-й итерации**, не лучше:
